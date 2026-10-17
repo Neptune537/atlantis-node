@@ -1,0 +1,13 @@
+[package]
+name = "tide_ledger"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Atlantis Tide Ledger double-entry accounting engine, Coral Escrow vaults, and Coral State Channels"
+
+[dependencies]
+atlantis_protocol = { path = "../atlantis_protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

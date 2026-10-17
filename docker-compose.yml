@@ -1,0 +1,11 @@
+services:
+  atlantis-home-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: atlantis-home-node
+    restart: unless-stopped
+    environment:
+      - ATLANTIS_NODE_ID=zero-rpi-home-node-01
+      - ATLANTIS_DIVIDEND_RATE=0.02
+      - RUST_LOG=info

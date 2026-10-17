@@ -1,0 +1,11 @@
+[package]
+name = "solana_programs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Atlantis on-chain Solana Token-2022 CYAN mint, minimum stake validation, and quadratic DAO voting"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

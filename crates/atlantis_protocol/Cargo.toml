@@ -1,0 +1,14 @@
+[package]
+name = "atlantis_protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Kuroshio Gyre mesh wire protocol, Pearl Enclave DID identity, and Bioluminescence PoH telemetry"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "ai_gate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "SoloGate / ClubGate Zero-Config LAN AI discovery (mDNS), PoH thermal routing, and tool-call firewall"
+
+[dependencies]
+atlantis_protocol = { path = "../atlantis_protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tracing.workspace = true
