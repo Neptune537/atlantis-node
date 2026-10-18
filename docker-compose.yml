@@ -5,7 +5,20 @@ services:
       dockerfile: Dockerfile
     container_name: atlantis-home-node
     restart: unless-stopped
+    ports:
+      # Double-Entry Ledger & Marketplace API
+      - "8081:8081"
+      # OpenRaft Consensus & Execution Rail WebSocket
+      - "9001:9001"
     environment:
       - ATLANTIS_NODE_ID=zero-rpi-home-node-01
       - ATLANTIS_DIVIDEND_RATE=0.02
       - RUST_LOG=info
+    volumes:
+      # Read Raspberry Pi real thermal sensor and memory info from host
+      - /sys/class/thermal:/sys/class/thermal:ro
+      - atlantis_data:/app/data
+
+volumes:
+  atlantis_data:
+    driver: local
