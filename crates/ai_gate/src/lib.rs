@@ -66,10 +66,308 @@ impl Default for CpuNpuFallbackWorker {
     }
 }
 
+/// Operational state of an AI model revolver chamber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChamberStatus {
+    Ready,
+    RateLimited,
+    QuotaExhausted,
+    Disabled,
+}
+
+/// A single chamber in the AI Model Revolver holding a free-tier endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevolverChamber {
+    pub slot_id: String,
+    pub provider_name: String,
+    pub model_name: String,
+    pub endpoint_url: String,
+    pub api_key_env_var: Option<String>,
+    pub rate_limit_rpm: u32,
+    pub rate_limit_rpd: u32,
+    pub current_minute_requests: u32,
+    pub current_day_requests: u32,
+    pub minute_window_start: u64,
+    pub day_window_start: u64,
+    pub status: ChamberStatus,
+    pub cooldown_until_epoch: u64,
+    pub total_successful_calls: u64,
+}
+
+impl RevolverChamber {
+    pub fn new(
+        slot_id: impl Into<String>,
+        provider_name: impl Into<String>,
+        model_name: impl Into<String>,
+        endpoint_url: impl Into<String>,
+        api_key_env_var: Option<&str>,
+        rate_limit_rpm: u32,
+        rate_limit_rpd: u32,
+    ) -> Self {
+        Self {
+            slot_id: slot_id.into(),
+            provider_name: provider_name.into(),
+            model_name: model_name.into(),
+            endpoint_url: endpoint_url.into(),
+            api_key_env_var: api_key_env_var.map(|s| s.to_string()),
+            rate_limit_rpm,
+            rate_limit_rpd,
+            current_minute_requests: 0,
+            current_day_requests: 0,
+            minute_window_start: 0,
+            day_window_start: 0,
+            status: ChamberStatus::Ready,
+            cooldown_until_epoch: 0,
+            total_successful_calls: 0,
+        }
+    }
+
+    /// Checks if this chamber is available to fire at the given epoch timestamp.
+    pub fn is_available(&mut self, now_secs: u64) -> bool {
+        if self.status == ChamberStatus::Disabled {
+            return false;
+        }
+
+        // Release rate limit if cooldown expired
+        if self.status == ChamberStatus::RateLimited {
+            if now_secs >= self.cooldown_until_epoch {
+                self.status = ChamberStatus::Ready;
+            } else {
+                return false;
+            }
+        }
+
+        // Refresh 60-second rolling window
+        if now_secs.saturating_sub(self.minute_window_start) >= 60 {
+            self.minute_window_start = now_secs;
+            self.current_minute_requests = 0;
+            if self.status == ChamberStatus::QuotaExhausted && self.current_day_requests < self.rate_limit_rpd {
+                self.status = ChamberStatus::Ready;
+            }
+        }
+
+        // Refresh 24-hour day window
+        if now_secs.saturating_sub(self.day_window_start) >= 86400 {
+            self.day_window_start = now_secs;
+            self.current_day_requests = 0;
+            self.status = ChamberStatus::Ready;
+        }
+
+        // Check rate limits
+        if self.rate_limit_rpm > 0 && self.current_minute_requests >= self.rate_limit_rpm {
+            return false;
+        }
+        if self.rate_limit_rpd > 0 && self.current_day_requests >= self.rate_limit_rpd {
+            self.status = ChamberStatus::QuotaExhausted;
+            return false;
+        }
+
+        true
+    }
+
+    /// Record a firing (consumption of 1 turn).
+    pub fn record_fire(&mut self, now_secs: u64) {
+        if now_secs.saturating_sub(self.minute_window_start) >= 60 {
+            self.minute_window_start = now_secs;
+            self.current_minute_requests = 0;
+        }
+        if now_secs.saturating_sub(self.day_window_start) >= 86400 {
+            self.day_window_start = now_secs;
+            self.current_day_requests = 0;
+        }
+        self.current_minute_requests += 1;
+        self.current_day_requests += 1;
+        self.total_successful_calls += 1;
+    }
+
+    /// Trip rate limit (e.g., HTTP 429 received from provider).
+    pub fn trip_rate_limit(&mut self, now_secs: u64, cooldown_secs: u64) {
+        self.status = ChamberStatus::RateLimited;
+        self.cooldown_until_epoch = now_secs + cooldown_secs;
+    }
+}
+
+/// The result returned when firing the revolver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevolverFireResult {
+    pub chamber: RevolverChamber,
+    pub is_gemini_fallback: bool,
+    pub chamber_index: usize,
+    pub total_chambers: usize,
+    pub message: String,
+}
+
+/// The Revolver cylinder managing round-robin turns across free models and fallback to Gemini Free Tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiModelRevolver {
+    pub chambers: Vec<RevolverChamber>,
+    pub current_cylinder_index: usize,
+    pub gemini_fallback: RevolverChamber,
+}
+
+impl Default for AiModelRevolver {
+    fn default() -> Self {
+        let chambers = vec![
+            RevolverChamber::new(
+                "groq_llama70b",
+                "Groq Cloud",
+                "llama-3.3-70b-versatile",
+                "https://api.groq.com/openai/v1/chat/completions",
+                Some("GROQ_API_KEY"),
+                30,
+                14400,
+            ),
+            RevolverChamber::new(
+                "openrouter_deepseek_r1",
+                "OpenRouter (Free)",
+                "deepseek/deepseek-r1:free",
+                "https://openrouter.ai/api/v1/chat/completions",
+                Some("OPENROUTER_API_KEY"),
+                20,
+                200,
+            ),
+            RevolverChamber::new(
+                "openrouter_llama33",
+                "OpenRouter (Free)",
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "https://openrouter.ai/api/v1/chat/completions",
+                Some("OPENROUTER_API_KEY"),
+                20,
+                200,
+            ),
+            RevolverChamber::new(
+                "cloudflare_llama",
+                "Cloudflare Workers AI",
+                "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                "https://api.cloudflare.com/client/v4/ai/run",
+                Some("CLOUDFLARE_API_TOKEN"),
+                50,
+                10000,
+            ),
+            RevolverChamber::new(
+                "ollama_local",
+                "Local Ollama (LAN)",
+                "qwen2.5:7b",
+                "http://127.0.0.1:11434/api/chat",
+                None,
+                0, // 0 = unlimited RPM
+                0, // 0 = unlimited RPD
+            ),
+        ];
+
+        let gemini_fallback = RevolverChamber::new(
+            "gemini_free_tier",
+            "Google Gemini (Free Tier)",
+            "gemini-2.5-flash",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            Some("GEMINI_API_KEY"),
+            15,   // 15 RPM free tier
+            1500, // 1500 RPD free tier
+        );
+
+        Self {
+            chambers,
+            current_cylinder_index: 0,
+            gemini_fallback,
+        }
+    }
+}
+
+impl AiModelRevolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds or replaces a free model chamber in the revolver cylinder.
+    pub fn load_chamber(&mut self, chamber: RevolverChamber) {
+        if let Some(pos) = self.chambers.iter().position(|c| c.slot_id == chamber.slot_id) {
+            self.chambers[pos] = chamber;
+        } else {
+            self.chambers.push(chamber);
+        }
+    }
+
+    /// Spins the cylinder to take turns round-robin among free models until limits are met,
+    /// then seamlessly defaults to the Gemini Free Tier.
+    pub fn spin_and_fire(&mut self, now_secs: u64) -> RevolverFireResult {
+        let total = self.chambers.len();
+        if total == 0 {
+            self.gemini_fallback.record_fire(now_secs);
+            return RevolverFireResult {
+                chamber: self.gemini_fallback.clone(),
+                is_gemini_fallback: true,
+                chamber_index: 0,
+                total_chambers: 0,
+                message: "No revolver chambers loaded; defaulting directly to Gemini Free Tier".to_string(),
+            };
+        }
+
+        // Try every chamber starting from current_cylinder_index (taking turns)
+        for offset in 0..total {
+            let idx = (self.current_cylinder_index + offset) % total;
+            if self.chambers[idx].is_available(now_secs) {
+                self.chambers[idx].record_fire(now_secs);
+                // Advance cylinder to next chamber for subsequent call
+                self.current_cylinder_index = (idx + 1) % total;
+                let chamber = self.chambers[idx].clone();
+                return RevolverFireResult {
+                    chamber,
+                    is_gemini_fallback: false,
+                    chamber_index: idx,
+                    total_chambers: total,
+                    message: format!("Fired revolver chamber [{}] turn: {}", idx, self.chambers[idx].model_name),
+                };
+            }
+        }
+
+        // All free revolver chambers have met their limits / are on cooldown! Default to Gemini Free Tier
+        self.gemini_fallback.record_fire(now_secs);
+        RevolverFireResult {
+            chamber: self.gemini_fallback.clone(),
+            is_gemini_fallback: true,
+            chamber_index: self.current_cylinder_index,
+            total_chambers: total,
+            message: "All free model revolver limits met or exhausted; defaulted to Google Gemini Free Tier".to_string(),
+        }
+    }
+
+    /// Trips a specific chamber upon receiving an HTTP 429 / rate-limit response.
+    pub fn trip_chamber(&mut self, slot_id: &str, now_secs: u64, cooldown_secs: u64) -> bool {
+        if let Some(c) = self.chambers.iter_mut().find(|c| c.slot_id == slot_id) {
+            c.trip_rate_limit(now_secs, cooldown_secs);
+            true
+        } else if self.gemini_fallback.slot_id == slot_id {
+            self.gemini_fallback.trip_rate_limit(now_secs, cooldown_secs);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns a diagnostic snapshot of all revolver chambers.
+    pub fn status_summary(&mut self, now_secs: u64) -> Vec<(String, ChamberStatus, u32, u32, bool)> {
+        let mut list = Vec::new();
+        for c in &mut self.chambers {
+            let avail = c.is_available(now_secs);
+            list.push((c.slot_id.clone(), c.status, c.current_minute_requests, c.current_day_requests, avail));
+        }
+        let gemini_avail = self.gemini_fallback.is_available(now_secs);
+        list.push((
+            self.gemini_fallback.slot_id.clone(),
+            self.gemini_fallback.status,
+            self.gemini_fallback.current_minute_requests,
+            self.gemini_fallback.current_day_requests,
+            gemini_avail,
+        ));
+        list
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AiRouteDecision {
     RoutedToLanGpu(LanAiWorker),
     RoutedToHomeNodeFallback(CpuNpuFallbackWorker),
+    RoutedToRevolver(RevolverFireResult),
     EscalatedToOwnerWebRtc { reason: String },
 }
 
@@ -79,6 +377,7 @@ pub struct LocalAiGate {
     pub official_catalog: HashMap<String, StoreCatalogItem>,
     pub human_rep_online: bool,
     pub fallback_worker: CpuNpuFallbackWorker,
+    pub revolver: AiModelRevolver,
 }
 
 impl Default for LocalAiGate {
@@ -88,6 +387,7 @@ impl Default for LocalAiGate {
             official_catalog: HashMap::new(),
             human_rep_online: false,
             fallback_worker: CpuNpuFallbackWorker::default(),
+            revolver: AiModelRevolver::default(),
         }
     }
 }
@@ -271,5 +571,41 @@ mod tests {
             .verify_ai_proposed_cart(&tampered_cart)
             .expect_err("tampered cart must fail");
         assert!(matches!(err, AiGateError::PriceMismatchBlocked(_, _, _)));
+    }
+
+    #[test]
+    fn test_revolver_round_robin_turns_and_gemini_fallback() {
+        let mut revolver = AiModelRevolver::default();
+        let now_secs = 100_000;
+
+        // Verify loaded chambers
+        assert_eq!(revolver.chambers.len(), 5);
+
+        // Turn 1: Fires chamber 0 (groq_llama70b)
+        let fire1 = revolver.spin_and_fire(now_secs);
+        assert_eq!(fire1.chamber.slot_id, "groq_llama70b");
+        assert!(!fire1.is_gemini_fallback);
+
+        // Turn 2: Fires chamber 1 (openrouter_deepseek_r1)
+        let fire2 = revolver.spin_and_fire(now_secs);
+        assert_eq!(fire2.chamber.slot_id, "openrouter_deepseek_r1");
+        assert!(!fire2.is_gemini_fallback);
+
+        // Turn 3: Fires chamber 2 (openrouter_llama33)
+        let fire3 = revolver.spin_and_fire(now_secs);
+        assert_eq!(fire3.chamber.slot_id, "openrouter_llama33");
+        assert!(!fire3.is_gemini_fallback);
+
+        // Trip all free chambers to simulate rate limits (HTTP 429) being met
+        for chamber in &mut revolver.chambers {
+            chamber.trip_rate_limit(now_secs, 120);
+        }
+
+        // All free models exhausted: Revolver defaults to Gemini Free Tier
+        let fire_fallback = revolver.spin_and_fire(now_secs);
+        assert!(fire_fallback.is_gemini_fallback);
+        assert_eq!(fire_fallback.chamber.slot_id, "gemini_free_tier");
+        assert_eq!(fire_fallback.chamber.model_name, "gemini-2.5-flash");
+        assert!(fire_fallback.message.contains("defaulted to Google Gemini Free Tier"));
     }
 }

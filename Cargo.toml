@@ -6,6 +6,7 @@ members = [
     "crates/home_node",
     "crates/ai_gate",
     "crates/solana_programs",
+    "crates/olympus",
 ]
 
 [workspace.package]
@@ -23,6 +24,9 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
 sha2 = "0.10"
 tracing = "0.1"
+sysinfo = "0.33"
+ratatui = "0.28"
+crossterm = "0.28"
 
 [profile.release]
 opt-level = 3

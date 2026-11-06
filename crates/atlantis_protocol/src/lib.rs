@@ -11,6 +11,24 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod social_club;
+pub use social_club::*;
+
+pub mod webrtc_sync;
+pub use webrtc_sync::*;
+
+pub mod fortress_theater;
+pub use fortress_theater::*;
+
+pub mod episode_wire;
+pub use episode_wire::*;
+
+pub mod lumeria_sdk;
+pub use lumeria_sdk::*;
+
+pub mod graduation_governance;
+pub use graduation_governance::*;
+
 /// Errors emitted by the Atlantis Protocol & Pearl Enclave subsystem.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AtlantisProtocolError {
@@ -115,7 +133,41 @@ pub enum AtlantisAsset {
     Usd,
     Usdc,
     Cyan,
+    Pearl,
     Credit,
+}
+
+/// Specific category of asynchronous offloaded compute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComputeJobType {
+    /// DEM terrain elevation heightfield tiling into B3DM meshlet clusters.
+    DemElevationTiling { resolution: u32, target_lod: u8 },
+    /// 3D Gaussian Splatting bounding ellipsoid and convex collision hull synthesis.
+    GaussianSplatHullSynthesis { max_convex_hulls: u32 },
+}
+
+/// Asynchronous Compute Task Envelope dispatched over Kuroshio Sonar / WebTransport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AsynchronousComputeJob {
+    pub job_id: Uuid,
+    pub client_did: String,
+    pub job_type: ComputeJobType,
+    pub payload_uri: String,
+    pub input_hash: [u8; 32],
+    pub escrow_account_id: String,
+    pub max_latency_secs: u32,
+    pub reward_cyan: f64,
+}
+
+/// Cryptographic receipt returned by Triton Anchor upon task completion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AsynchronousExecutionReceipt {
+    pub job_id: Uuid,
+    pub worker_did: String,
+    pub output_data_uri: String,
+    pub output_merkle_root: [u8; 32],
+    pub execution_duration_ms: u64,
+    pub signature: Vec<u8>,
 }
 
 /// Marketplace & Real-World service job categories.
@@ -185,6 +237,14 @@ pub enum KuroshioEventPayload {
         escrow_id: Uuid,
         recipient_did: String,
         club_dividend: f64,
+    },
+    /// Tactical command & frontline status broadcast routed over the Kuroshio Gyre Sonar Relay (`gyre:sonar:tactical`).
+    KuroshioTacticalComm {
+        channel_topic: String,
+        sector_code: String,
+        sender_callsign: String,
+        message: String,
+        priority: u8,
     },
     SirenFrequencyFrame {
         channel: String,
@@ -709,10 +769,15 @@ impl PohCanaryChallenge {
 /// Canonical topic constants for the Kuroshio Gyre mesh pub/sub router.
 pub mod topics {
     pub const TELEMETRY_GLOBAL: &str = "gyre:telemetry:global";
+    pub const SONAR_TACTICAL: &str = "gyre:sonar:tactical";
+    pub const SONAR_SECTOR_PREFIX: &str = "gyre:sonar:sector:";
     pub const JOBS_DELIVERY: &str = "gyre:jobs:delivery";
     pub const JOBS_DJ: &str = "gyre:jobs:dj";
     pub const JOBS_AUTO_REPAIR: &str = "gyre:jobs:auto_repair";
     pub const SIREN_FREQUENCY_PREFIX: &str = "siren:frequency:";
+    pub const SIREN_THEATER_OST: &str = "siren:frequency:guardians-creed";
+    pub const SIREN_TACTICAL_COMMS: &str = "siren:frequency:tactical-command";
+    pub const SIREN_DEEP_GYRE_SYNTH: &str = "siren:frequency:deep-gyre";
 }
 
 /// WebTransport / WebSocket pub/sub wire frame for topic routing across Club Home Nodes.
@@ -759,11 +824,14 @@ impl PubSubTopicFrame {
         matches!(
             topic,
             topics::TELEMETRY_GLOBAL
+                | topics::SONAR_TACTICAL
                 | topics::JOBS_DELIVERY
                 | topics::JOBS_DJ
                 | topics::JOBS_AUTO_REPAIR
-        ) || (topic.starts_with(topics::SIREN_FREQUENCY_PREFIX)
-            && topic.len() > topics::SIREN_FREQUENCY_PREFIX.len())
+        ) || (topic.starts_with(topics::SONAR_SECTOR_PREFIX)
+            && topic.len() > topics::SONAR_SECTOR_PREFIX.len())
+            || (topic.starts_with(topics::SIREN_FREQUENCY_PREFIX)
+                && topic.len() > topics::SIREN_FREQUENCY_PREFIX.len())
     }
 
     /// Validates both the topic namespace and, if this is a `Publish` frame, the cryptographic signature of the envelope.
@@ -924,5 +992,208 @@ mod tests {
         };
         assert!(!invalid_topic_frame.validate());
     }
+
+    #[test]
+    fn test_club_graduation_and_location_disclosure_policy() {
+        let club_identity = PearlEnclaveIdentity::from_label("club-shinjuku-node");
+        let member_identity = PearlEnclaveIdentity::from_label("delivery-courier-01");
+
+        // Graduate onto club node
+        let cert = ClubGraduationCertificate::issue(
+            &club_identity,
+            member_identity.did(),
+            "club-shinjuku-node",
+            vec!["courier".to_string(), "mechanic".to_string()],
+            1_700_000_000,
+            1_750_000_000,
+        )
+        .expect("Certificate issuance should succeed");
+
+        assert!(cert.verify().is_ok());
+
+        // Private high precision location stored at club node
+        let private_telemetry = PrivateLocationTelemetry {
+            latitude_deg: 35.6895,
+            longitude_deg: 139.6917,
+            altitude_m: 45.2,
+            ecef_x_m: -3959950.0,
+            ecef_y_m: 3350490.0,
+            ecef_z_m: 3699700.0,
+            timestamp_ms: 1_700_000_100,
+        };
+
+        // Obfuscate to public network
+        let public_view = LocationDisclosurePolicy::ObfuscatedSector { sector_id: 1042 }
+            .apply(&private_telemetry, member_identity.did());
+
+        match public_view {
+            PublicLocationDisclosure::ObfuscatedSector { sector_id, .. } => {
+                assert_eq!(sector_id, 1042);
+            }
+            _ => panic!("Expected ObfuscatedSector"),
+        }
+    }
 }
+
+// ============================================================================
+// NAUTILUS WORLD SERVER & CLUB GRADUATION STRUCTURES
+// ============================================================================
+
+/// Private, high-precision location telemetry stored strictly in the Club Home Node vault.
+/// MUST NEVER be broadcast directly to the public network.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrivateLocationTelemetry {
+    pub latitude_deg: f64,
+    pub longitude_deg: f64,
+    pub altitude_m: f64,
+    pub ecef_x_m: f64,
+    pub ecef_y_m: f64,
+    pub ecef_z_m: f64,
+    pub timestamp_ms: u64,
+}
+
+/// The authorized public location view permitted by the Club Home Node's policy engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PublicLocationDisclosure {
+    /// Hidden completely from public discovery
+    Hidden,
+    /// Coarse neighborhood or administrative sector
+    ObfuscatedSector {
+        sector_id: u32,
+        publisher_did: String,
+    },
+    /// Bounded active delivery/travel corridor with dynamic fuzzy radius
+    ActiveCorridor {
+        center_ecef: [f64; 3],
+        fuzzy_radius_m: f32,
+        job_id: String,
+    },
+    /// Cryptographic zero-knowledge geofence proof
+    ZeroKnowledgeProof {
+        zone_hash: [u8; 32],
+        is_inside: bool,
+    },
+}
+
+/// Disclosure policies enforced by the Club Home Node before transmitting data to Nautilus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum LocationDisclosurePolicy {
+    PrivateVaultOnly,
+    ObfuscatedSector { sector_id: u32 },
+    ActiveJobCorridor { fuzzy_radius_m: f32, job_id: String },
+    ZeroKnowledgeGeofence { zone_hash: [u8; 32] },
+}
+
+impl LocationDisclosurePolicy {
+    pub fn apply(
+        &self,
+        private: &PrivateLocationTelemetry,
+        publisher_did: &str,
+    ) -> PublicLocationDisclosure {
+        match self {
+            Self::PrivateVaultOnly => PublicLocationDisclosure::Hidden,
+            Self::ObfuscatedSector { sector_id } => PublicLocationDisclosure::ObfuscatedSector {
+                sector_id: *sector_id,
+                publisher_did: publisher_did.to_string(),
+            },
+            Self::ActiveJobCorridor { fuzzy_radius_m, job_id } => {
+                PublicLocationDisclosure::ActiveCorridor {
+                    center_ecef: [private.ecef_x_m, private.ecef_y_m, private.ecef_z_m],
+                    fuzzy_radius_m: *fuzzy_radius_m,
+                    job_id: job_id.clone(),
+                }
+            }
+            Self::ZeroKnowledgeGeofence { zone_hash } => {
+                PublicLocationDisclosure::ZeroKnowledgeProof {
+                    zone_hash: *zone_hash,
+                    is_inside: true,
+                }
+            }
+        }
+    }
+}
+
+/// Certificate issued when an edge node graduates onto a sovereign Club Home Node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClubGraduationCertificate {
+    pub node_did: String,
+    pub club_id: String,
+    pub club_did: String,
+    pub roles: Vec<String>,
+    pub issued_at_s: u64,
+    pub expires_at_s: u64,
+    pub signature_hex: String,
+}
+
+impl ClubGraduationCertificate {
+    pub fn issue(
+        club_identity: &PearlEnclaveIdentity,
+        node_did: &str,
+        club_id: &str,
+        roles: Vec<String>,
+        issued_at_s: u64,
+        expires_at_s: u64,
+    ) -> Result<Self, AtlantisProtocolError> {
+        let msg = format!(
+            "GRADUATION:{}:{}:{}:{}:{}",
+            node_did,
+            club_id,
+            roles.join(","),
+            issued_at_s,
+            expires_at_s
+        );
+        let sig = club_identity.signing_key().sign(msg.as_bytes());
+
+        Ok(Self {
+            node_did: node_did.to_string(),
+            club_id: club_id.to_string(),
+            club_did: club_identity.did().to_string(),
+            roles,
+            issued_at_s,
+            expires_at_s,
+            signature_hex: bytes_to_hex(&sig.to_bytes()),
+        })
+    }
+
+    pub fn verify(&self) -> Result<(), AtlantisProtocolError> {
+        let pubkey_hex = self
+            .club_did
+            .strip_prefix("did:atlantis:")
+            .ok_or_else(|| AtlantisProtocolError::InvalidDidFormat(self.club_did.clone()))?;
+        let pubkey_bytes = hex_to_bytes(pubkey_hex)?;
+        if pubkey_bytes.len() != 32 {
+            return Err(AtlantisProtocolError::CryptoError(
+                "Invalid pubkey length, expected 32 bytes".to_string(),
+            ));
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&pubkey_bytes);
+        let verifying_key = VerifyingKey::from_bytes(&key_arr)
+            .map_err(|e| AtlantisProtocolError::CryptoError(e.to_string()))?;
+
+        let sig_bytes = hex_to_bytes(&self.signature_hex)?;
+        if sig_bytes.len() != 64 {
+            return Err(AtlantisProtocolError::CryptoError(
+                "Invalid signature length, expected 64 bytes".to_string(),
+            ));
+        }
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = Signature::from_bytes(&sig_arr);
+
+        let msg = format!(
+            "GRADUATION:{}:{}:{}:{}:{}",
+            self.node_did,
+            self.club_id,
+            self.roles.join(","),
+            self.issued_at_s,
+            self.expires_at_s
+        );
+
+        verifying_key
+            .verify(msg.as_bytes(), &sig)
+            .map_err(|e| AtlantisProtocolError::CryptoError(e.to_string()))
+    }
+}
+
 

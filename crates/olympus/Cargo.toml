@@ -1,0 +1,20 @@
+[package]
+name = "olympus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Olympus: Sub-Polar Apex Authority, Master Epoch Clock, Root IAM, and Oyashio Cold Return state engine"
+
+[dependencies]
+atlantis_protocol = { path = "../atlantis_protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+solana_programs = { path = "../solana_programs" }

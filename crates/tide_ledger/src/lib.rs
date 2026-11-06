@@ -21,6 +21,8 @@ pub enum LedgerError {
     InvalidEscrowState(Uuid),
     #[error("Audit invariant violated: debits and credits do not balance")]
     AuditInvariantViolation,
+    #[error("Database error: {0}")]
+    DatabaseError(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +33,9 @@ pub enum LedgerTxType {
     EscrowLock,
     EscrowRelease,
     ClubDividend,
+    EventTicketPurchase,
+    EventSplitPayout,
+    MiniAppDeveloperShare,
     Withdrawal,
 }
 
@@ -131,6 +136,121 @@ impl TideLedgerEngine {
         Ok(tx)
     }
 
+    /// Persists the current in-memory ledger state into a SQLite database.
+    pub fn persist_to_sqlite(&self, db_path: &str) -> Result<(), LedgerError> {
+        let conn = rusqlite::Connection::open(db_path)
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                balance REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS transactions (
+                id TEXT PRIMARY KEY,
+                tx_type TEXT NOT NULL,
+                reference_id TEXT NOT NULL,
+                debit_account TEXT NOT NULL,
+                credit_account TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                amount REAL NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('coral_holding_account', ?1)",
+            rusqlite::params![self.coral_vault_holding_account.to_string()],
+        )
+        .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+
+        for (account_id, balance) in &self.balances {
+            tx.execute(
+                "INSERT OR REPLACE INTO accounts (id, balance) VALUES (?1, ?2)",
+                rusqlite::params![account_id.to_string(), balance],
+            )
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+        }
+
+        for entry in &self.transactions {
+            tx.execute(
+                "INSERT OR IGNORE INTO transactions (id, tx_type, reference_id, debit_account, credit_account, asset, amount, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    entry.id.to_string(),
+                    format!("{:?}", entry.tx_type),
+                    entry.reference_id.to_string(),
+                    entry.debit_account.to_string(),
+                    entry.credit_account.to_string(),
+                    format!("{:?}", entry.asset),
+                    entry.amount,
+                    entry.timestamp as i64,
+                ],
+            )
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+        }
+
+        tx.commit()
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Loads the ledger state from an existing SQLite database.
+    pub fn load_from_sqlite(db_path: &str) -> Result<Self, LedgerError> {
+        let conn = rusqlite::Connection::open(db_path)
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM metadata WHERE key = 'coral_holding_account'")
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+        let holding_id_str: Option<String> = stmt
+            .query_row([], |row| row.get(1))
+            .ok();
+
+        let holding_id = holding_id_str
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .unwrap_or_else(Uuid::new_v4);
+
+        let mut balances = HashMap::new();
+        let mut stmt = conn
+            .prepare("SELECT id, balance FROM accounts")
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+        let account_rows = stmt
+            .query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let bal: f64 = row.get(1)?;
+                Ok((id_str, bal))
+            })
+            .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
+
+        for row in account_rows {
+            if let Ok((id_str, bal)) = row {
+                if let Ok(uid) = Uuid::parse_str(&id_str) {
+                    balances.insert(uid, bal);
+                }
+            }
+        }
+
+        balances.entry(holding_id).or_insert(0.0);
+
+        Ok(Self {
+            balances,
+            transactions: Vec::new(),
+            escrows: HashMap::new(),
+            coral_vault_holding_account: holding_id,
+        })
+    }
+
     /// Locks buyer funds into Coral Escrow when a Marketplace Job is created.
     pub fn lock_coral_escrow(
         &mut self,
@@ -213,6 +333,60 @@ impl TideLedgerEngine {
         }
 
         Ok((worker_tx, dividend_tx))
+    }
+
+    /// Settles an asynchronous compute job per PROP-0043:
+    /// - Disburses reward (e.g. 10.0 CYAN)
+    /// - 80% to Worker Anchor
+    /// - 15% to Guild Treasury
+    /// - 5% permanently burned (retained in holding account as burned fee)
+    pub fn settle_async_compute_escrow(
+        &mut self,
+        escrow_id: Uuid,
+        worker_account: Uuid,
+        guild_treasury_account: Uuid,
+        timestamp: u64,
+    ) -> Result<(LedgerTransaction, LedgerTransaction, f64), LedgerError> {
+        let vault = self
+            .escrows
+            .get(&escrow_id)
+            .cloned()
+            .ok_or(LedgerError::InvalidEscrowState(escrow_id))?;
+
+        if vault.status != EscrowStatus::AuthorizedLocked {
+            return Err(LedgerError::InvalidEscrowState(escrow_id));
+        }
+
+        let worker_amount = vault.locked_amount * 0.80;
+        let treasury_amount = vault.locked_amount * 0.15;
+        let burned_amount = vault.locked_amount * 0.05;
+
+        let worker_tx = self.record_double_entry(
+            LedgerTxType::EscrowRelease,
+            vault.job_id,
+            self.coral_vault_holding_account,
+            worker_account,
+            vault.asset,
+            worker_amount,
+            timestamp,
+        )?;
+
+        let treasury_tx = self.record_double_entry(
+            LedgerTxType::ClubDividend,
+            vault.job_id,
+            self.coral_vault_holding_account,
+            guild_treasury_account,
+            vault.asset,
+            treasury_amount,
+            timestamp,
+        )?;
+
+        if let Some(v) = self.escrows.get_mut(&escrow_id) {
+            v.worker_account = Some(worker_account);
+            v.status = EscrowStatus::CompletedReleased;
+        }
+
+        Ok((worker_tx, treasury_tx, burned_amount))
     }
 
     /// Opens an ephemeral high-frequency `CoralStateChannel` by locking `locked_deposit`
@@ -578,6 +752,94 @@ pub struct AuditInvariantReport {
     pub invariants_passed: bool,
 }
 
+// ============================================================================
+// EVENT TICKETING & MULTI-PARTY SPLIT PAYOUT ENGINE
+// ============================================================================
+
+/// Configuration for split payout distribution of an event's ticket revenues.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventPayoutSplitRule {
+    pub recipient_account: Uuid,
+    pub share_ratio: f64, // e.g. 0.60 (60% to host/venue), 0.30 (30% to talent), 0.10 (10% to dev)
+    pub role_label: String,
+}
+
+impl TideLedgerEngine {
+    /// Executes a ticket purchase with double-entry recording into the holding account.
+    pub fn purchase_event_ticket(
+        &mut self,
+        buyer_account: Uuid,
+        event_id: Uuid,
+        ticket_price: f64,
+        asset: AtlantisAsset,
+        timestamp: u64,
+    ) -> Result<LedgerTransaction, LedgerError> {
+        self.record_double_entry(
+            LedgerTxType::EventTicketPurchase,
+            event_id,
+            buyer_account,
+            self.coral_vault_holding_account,
+            asset,
+            ticket_price,
+            timestamp,
+        )
+    }
+
+    /// Automatically distributes pooled ticket revenues among hosts, venues, performers, and developers.
+    pub fn execute_event_split_payout(
+        &mut self,
+        event_id: Uuid,
+        total_revenue: f64,
+        asset: AtlantisAsset,
+        split_rules: &[EventPayoutSplitRule],
+        timestamp: u64,
+    ) -> Result<Vec<LedgerTransaction>, LedgerError> {
+        if split_rules.is_empty() {
+            return Err(LedgerError::AuditInvariantViolation);
+        }
+
+        let total_ratio: f64 = split_rules.iter().map(|r| r.share_ratio).sum();
+        if (total_ratio - 1.0).abs() > 0.001 {
+            return Err(LedgerError::AuditInvariantViolation);
+        }
+
+        let mut txs = Vec::with_capacity(split_rules.len());
+        let mut distributed_sum = 0.0;
+
+        for (idx, rule) in split_rules.iter().enumerate() {
+            let payout_amount = if idx == split_rules.len() - 1 {
+                // Ensure remaining balance precisely matches to prevent rounding leaks
+                (total_revenue - distributed_sum).max(0.0)
+            } else {
+                let amount = (total_revenue * rule.share_ratio * 100.0).round() / 100.0;
+                distributed_sum += amount;
+                amount
+            };
+
+            let tx_type = if rule.role_label.to_lowercase().contains("dev")
+                || rule.role_label.to_lowercase().contains("app")
+            {
+                LedgerTxType::MiniAppDeveloperShare
+            } else {
+                LedgerTxType::EventSplitPayout
+            };
+
+            let tx = self.record_double_entry(
+                tx_type,
+                event_id,
+                self.coral_vault_holding_account,
+                rule.recipient_account,
+                asset,
+                payout_amount,
+                timestamp,
+            )?;
+            txs.push(tx);
+        }
+
+        Ok(txs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +937,73 @@ mod tests {
             .expect("qualifying stake should yield cyan");
 
         assert!((cyan_tx.amount - 1.5).abs() < 1e-6);
+        assert!(ledger.verify_audit_invariants().is_ok());
+    }
+
+    #[test]
+    fn test_event_ticketing_and_multi_party_split_payout() {
+        let mut ledger = TideLedgerEngine::new();
+
+        let attendee = Uuid::new_v4();
+        let host_venue = Uuid::new_v4();
+        let performer = Uuid::new_v4();
+        let app_developer = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+
+        ledger.seed_account(attendee, 100.0);
+        ledger.seed_account(host_venue, 0.0);
+        ledger.seed_account(performer, 0.0);
+        ledger.seed_account(app_developer, 0.0);
+
+        // Attendee buys ticket for 100.0 USDC
+        ledger
+            .purchase_event_ticket(attendee, event_id, 100.0, AtlantisAsset::Usdc, 1_700_000_000)
+            .expect("Ticket purchase failed");
+
+        assert_eq!(*ledger.balances.get(&attendee).unwrap(), 0.0);
+        assert_eq!(
+            *ledger.balances.get(&ledger.coral_vault_holding_account).unwrap(),
+            100.0
+        );
+
+        // Split payout rules: 60% Host/Venue, 30% Performer, 10% Mini-App Developer
+        let rules = vec![
+            EventPayoutSplitRule {
+                recipient_account: host_venue,
+                share_ratio: 0.60,
+                role_label: "Host/Venue".to_string(),
+            },
+            EventPayoutSplitRule {
+                recipient_account: performer,
+                share_ratio: 0.30,
+                role_label: "Performer".to_string(),
+            },
+            EventPayoutSplitRule {
+                recipient_account: app_developer,
+                share_ratio: 0.10,
+                role_label: "Mini-App Developer".to_string(),
+            },
+        ];
+
+        let txs = ledger
+            .execute_event_split_payout(
+                event_id,
+                100.0,
+                AtlantisAsset::Usdc,
+                &rules,
+                1_700_005_000,
+            )
+            .expect("Split payout execution failed");
+
+        assert_eq!(txs.len(), 3);
+        assert_eq!(*ledger.balances.get(&host_venue).unwrap(), 60.0);
+        assert_eq!(*ledger.balances.get(&performer).unwrap(), 30.0);
+        assert_eq!(*ledger.balances.get(&app_developer).unwrap(), 10.0);
+        assert_eq!(
+            *ledger.balances.get(&ledger.coral_vault_holding_account).unwrap(),
+            0.0
+        );
+
         assert!(ledger.verify_audit_invariants().is_ok());
     }
 }

@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+pub mod slashing;
+pub use slashing::*;
+
 pub const MIN_QUALIFYING_STAKE_USD: u64 = 10;
 pub const MONTHLY_SUBSCRIPTION_FEE_USD: u64 = 1;
 pub const MAX_CYAN_TOKEN_SUPPLY: u64 = 1_000_000_000;

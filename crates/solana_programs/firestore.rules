@@ -1,0 +1,50 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function verifying if request caller is an authenticated Pearl Enclave service worker
+    function isPearlEnclaveAuthority() {
+      return request.auth != null && 
+        (request.auth.token.firebase.sign_in_provider == 'custom' && 
+         request.auth.token.pearl_enclave_authorized == true);
+    }
+    
+    // Helper function checking ownership based on Solana wallet DID
+    function isOwner(playerDid) {
+      return request.auth != null && 
+        (request.auth.uid == playerDid || 
+         request.auth.token.solana_address != null && 
+         playerDid == 'did:atlantis:solana:' + request.auth.token.solana_address);
+    }
+
+    // User profiles & on-chain inventory mirror
+    match /users/{playerDid} {
+      // Any authenticated player can read their own profile; public match viewers can read public fields
+      allow read: if request.auth != null;
+      
+      // Strict Invariant: Staking tiers, token balances, and card inventories CANNOT be written by clients directly.
+      // Writes must originate from the Ursula / Club Home Node backend with Pearl Enclave verification.
+      allow create, update: if isPearlEnclaveAuthority();
+      
+      // Players may only modify cosmetic preferences or UI layout choices
+      allow update: if isOwner(playerDid) && 
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['staked_cyan', 'tier_level', 'inventory', 'last_sync_slot']);
+        
+      allow delete: if false; // User accounts are persistent and cannot be deleted from edge
+    }
+
+    // Match sessions & WebRTC room metadata
+    match /matches/{matchId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && request.resource.data.host_did == request.auth.uid;
+      allow update: if isPearlEnclaveAuthority() || 
+        (request.auth != null && resource.data.participants.hasAny([request.auth.uid]));
+    }
+    
+    // Daily episodic transcripts & narrative logs (1,095 episodes)
+    match /episodes/{episodeId} {
+      allow read: if true; // Public broadcasts are streamable by all clients
+      allow write: if isPearlEnclaveAuthority(); // Only Autonomous Research Agent / Director writes
+    }
+  }
+}

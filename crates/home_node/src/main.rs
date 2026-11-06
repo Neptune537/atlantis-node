@@ -1,3 +1,5 @@
+mod tui;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -55,44 +57,70 @@ pub struct CreateTaskRequest {
     pub buyer_did: String,
     pub buyer_account: Uuid,
     pub budget_amount: f64,
+    #[serde(default)]
+    pub asset: Option<atlantis_protocol::AtlantisAsset>,
+    #[serde(default)]
+    pub category: Option<atlantis_protocol::JobCategory>,
+    #[serde(default)]
+    pub min_poh_score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraduateInitiateRequest {
+    pub node_did: String,
+    pub callsign: String,
+    pub role: home_node::ClubOfficerRole,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    pub validity_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRoleRequest {
+    pub node_did: String,
+    pub new_role: home_node::ClubOfficerRole,
 }
 
 pub struct AppState {
     pub home_node: RwLock<ClubHomeNode>,
     pub telemetry_tx: broadcast::Sender<RailWebSocketMessage>,
+    pub sysinfo_state: std::sync::Mutex<sysinfo::System>,
+    pub components_state: std::sync::Mutex<sysinfo::Components>,
 }
 
-fn read_system_telemetry(node_id: &str, raft_term: u64, committed_log_index: u64) -> TelemetryPayload {
-    // Read real thermal sensor if running on Linux/Raspberry Pi
-    let cpu_temp_celsius = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
-        .ok()
-        .and_then(|s| s.trim().parse::<f32>().ok().map(|milli| milli / 1000.0))
+fn read_system_telemetry(
+    node_id: &str,
+    raft_term: u64,
+    committed_log_index: u64,
+    sys: &mut sysinfo::System,
+    components: &mut sysinfo::Components,
+) -> TelemetryPayload {
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    components.refresh(false);
+
+    let cpu_usage_percent = sys.global_cpu_usage();
+    let free_ram_mb = sys.available_memory() / 1024 / 1024;
+    let total_ram_mb = sys.total_memory() / 1024 / 1024;
+
+    // Detect thermal sensor dynamically across Linux, macOS, and Windows via sysinfo,
+    // with thermal_zone0 fallback on embedded Linux boards
+    let cpu_temp_celsius = components
+        .iter()
+        .find(|c| {
+            let label = c.label().to_lowercase();
+            label.contains("cpu") || label.contains("core") || label.contains("soc")
+        })
+        .and_then(|c| c.temperature())
         .or_else(|| {
-            // macOS / Windows fallback
-            Some(48.5)
+            components.iter().next().and_then(|c| c.temperature())
+        })
+        .or_else(|| {
+            std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+                .ok()
+                .and_then(|s| s.trim().parse::<f32>().ok().map(|m| m / 1000.0))
         });
 
-    let (free_ram_mb, total_ram_mb) = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .map(|meminfo| {
-            let mut total_kb = 3800000u64;
-            let mut free_kb = 2500000u64;
-            for line in meminfo.lines() {
-                if line.starts_with("MemTotal:") {
-                    if let Some(val) = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()) {
-                        total_kb = val;
-                    }
-                } else if line.starts_with("MemAvailable:") {
-                    if let Some(val) = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()) {
-                        free_kb = val;
-                    }
-                }
-            }
-            (free_kb / 1024, total_kb / 1024)
-        })
-        .unwrap_or((3200, 3800));
-
-    let cpu_usage_percent = 4.2;
     let p99_latency_ms = 4.0;
     let poh_score = 98.5;
 
@@ -153,20 +181,126 @@ async fn post_create_task(
         .unwrap_or_default()
         .as_secs();
 
+    let category = payload.category.unwrap_or_else(|| atlantis_protocol::JobCategory::ComputeTask {
+        shader_or_pipeline: "dem_tile_baking_wgsl".to_string(),
+        input_uri: "gyre://tiles/dem/tile_34_82.bin".to_string(),
+    });
+
+    let asset = payload.asset.unwrap_or(atlantis_protocol::AtlantisAsset::Usdc);
+    let min_poh = payload.min_poh_score.unwrap_or(50.0);
+
     match node.dispatch_marketplace_job(
         payload.buyer_did,
         payload.buyer_account,
-        atlantis_protocol::JobCategory::ComputeTask {
-            shader_or_pipeline: "dem_tile_baking_wgsl".to_string(),
-            input_uri: "gyre://tiles/dem/tile_34_82.bin".to_string(),
-        },
+        category,
         payload.budget_amount,
-        atlantis_protocol::AtlantisAsset::Usdc,
-        50.0,
+        asset,
+        min_poh,
         timestamp,
     ) {
         Ok((_vault, envelope)) => Ok(Json(envelope)),
         Err(e) => Err((StatusCode::BAD_REQUEST, format!("Ledger Error: {}", e))),
+    }
+}
+
+async fn get_club_officers(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<home_node::OperativeRecord>> {
+    let node = state.home_node.read().await;
+    Json(node.registry.list_officers())
+}
+
+async fn post_graduate_initiate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GraduateInitiateRequest>,
+) -> Result<Json<atlantis_protocol::ClubGraduationCertificate>, (StatusCode, String)> {
+    let mut node = state.home_node.write().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let validity_duration = req.validity_days.unwrap_or(365) * 86400;
+
+    node.registry
+        .graduate_initiate(
+            &req.node_did,
+            &req.callsign,
+            req.role,
+            req.permissions,
+            now,
+            validity_duration,
+            atlantis_protocol::LocationDisclosurePolicy::ObfuscatedSector { sector_id: 1001 },
+        )
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Graduation Error: {}", e)))
+}
+
+async fn post_assign_role(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UpdateRoleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut node = state.home_node.write().await;
+    node.registry
+        .assign_officer_role(&req.node_did, req.new_role)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+// ============================================================================
+// CHARTER QUANTITATIVE ENGINE PLUGIN ENDPOINTS (FOR NAUTILUS OFFICE DAEMONS)
+// ============================================================================
+
+async fn get_charter_strategies(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<home_node::CharterStrategy>> {
+    let node = state.home_node.read().await;
+    let strats: Vec<_> = node.charter_plugin.state.active_strategies.values().cloned().collect();
+    Json(strats)
+}
+
+#[derive(Deserialize)]
+struct ToggleCharterStrategyRequest {
+    strategy_id: String,
+    activated: bool,
+}
+
+async fn post_toggle_charter_strategy(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ToggleCharterStrategyRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut node = state.home_node.write().await;
+    node.charter_plugin
+        .set_strategy_active(&req.strategy_id, req.activated)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))
+}
+
+#[derive(Deserialize)]
+struct OfficeMarketTotemRequest {
+    pair_id: u32,
+    strategy_id: String,
+    camera_ecef: [f64; 3],
+}
+
+async fn post_charter_office_totem(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OfficeMarketTotemRequest>,
+) -> Result<Json<home_node::OfficeMarketTotem3D>, (StatusCode, String)> {
+    let mut node = state.home_node.write().await;
+    let office_ecef = node
+        .siren_radio_daemon
+        .fortress
+        .get_room_absolute_ecef("room_team7_office")
+        .unwrap_or(node.siren_radio_daemon.fortress.ecef_coords);
+
+    match node.charter_plugin.compute_office_totem_3d(
+        office_ecef,
+        req.camera_ecef,
+        req.pair_id,
+        &req.strategy_id,
+    ) {
+        Some(totem) => Ok(Json(totem)),
+        None => Err((StatusCode::NOT_FOUND, format!("Strategy '{}' not found", req.strategy_id))),
     }
 }
 
@@ -181,20 +315,26 @@ async fn handle_execution_rail_socket(mut socket: WebSocket, state: Arc<AppState
     let mut rx = state.telemetry_tx.subscribe();
 
     // Send initial snapshot
-    {
+    let initial_msg_str = {
         let node = state.home_node.read().await;
+        let mut sys = state.sysinfo_state.lock().unwrap();
+        let mut components = state.components_state.lock().unwrap();
         let initial_payload = read_system_telemetry(
             &node.club_node_id,
             node.consensus.current_term,
             node.consensus.committed_log_index,
+            &mut sys,
+            &mut components,
         );
         let msg = RailWebSocketMessage {
             r#type: "Telemetry".to_string(),
             payload: initial_payload,
         };
-        if let Ok(json_str) = serde_json::to_string(&msg) {
-            let _ = socket.send(Message::Text(json_str)).await;
-        }
+        serde_json::to_string(&msg).ok()
+    };
+
+    if let Some(json_str) = initial_msg_str {
+        let _ = socket.send(Message::Text(json_str)).await;
     }
 
     loop {
@@ -239,73 +379,168 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.02);
 
+    let peers_env = std::env::var("ATLANTIS_PEERS").unwrap_or_default();
+
     info!("Starting Atlantis Club Home Node daemon (Unified V2)...");
     info!("Node ID: {}", node_id);
     info!("Treasury Dividend Rate: {:.2}%", dividend_rate * 100.0);
 
-    let home_node = ClubHomeNode::new(&node_id, dividend_rate);
+    let mut home_node = ClubHomeNode::new(&node_id, dividend_rate);
+    for peer in peers_env.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        home_node.consensus.add_peer(peer);
+        info!("Registered consensus peer: {}", peer);
+    }
+
+    // Try restoring persistent SQLite ledger if database exists
+    let sqlite_db_path = "/app/data/atlantis_ledger.db";
+    if std::path::Path::new(sqlite_db_path).exists() {
+        match tide_ledger::TideLedgerEngine::load_from_sqlite(sqlite_db_path) {
+            Ok(restored_ledger) => {
+                info!("Restored {} account balances from SQLite ledger", restored_ledger.balances.len());
+                home_node.ledger = restored_ledger;
+            }
+            Err(e) => {
+                error!("Failed to restore SQLite ledger: {}. Initializing fresh ledger.", e);
+            }
+        }
+    }
+
+    // Try loading persistent DTN queue from disk if volume mounted
+    let spool_file = std::path::Path::new("/app/data/dtn_spool.json");
+    if let Ok(restored) = home_node.dtn_store.load_from_disk(spool_file) {
+        if restored > 0 {
+            info!("Restored {} DTN bundles from disk spool", restored);
+        }
+    }
+
     info!("Treasury account seeded: {}", home_node.club_treasury_account);
     info!("OpenRaft consensus initialized. Current role: {:?}", home_node.consensus.role);
     info!("Local AI Gate status: ready");
     info!("DTN store active: WAN status = {}", home_node.dtn_store.is_wan_online);
 
+    // Check if running in headless mode or if TUI should launch
+    let is_headless = std::env::var("ATLANTIS_HEADLESS").map(|v| v == "1" || v == "true").unwrap_or(false)
+        || std::env::args().any(|arg| arg == "--headless" || arg == "--daemon");
+
+    // Broadcast channel for WebSocket telemetry stream
     let (telemetry_tx, _) = broadcast::channel(128);
+
+    // Initialize shared state for TUI
+    let shared_tui_state = tui::create_shared_tui_state();
+
+    let mut initial_sys = sysinfo::System::new_all();
+    initial_sys.refresh_all();
+    let initial_components = sysinfo::Components::new_with_refreshed_list();
 
     let state = Arc::new(AppState {
         home_node: RwLock::new(home_node),
         telemetry_tx: telemetry_tx.clone(),
+        sysinfo_state: std::sync::Mutex::new(initial_sys),
+        components_state: std::sync::Mutex::new(initial_components),
     });
 
     // Background hardware telemetry loop (1Hz)
     let state_for_telemetry = Arc::clone(&state);
     let telemetry_tx_for_loop = telemetry_tx.clone();
+    let shared_tui_state_for_telemetry = Arc::clone(&shared_tui_state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1000));
         loop {
             interval.tick().await;
             let node = state_for_telemetry.home_node.read().await;
-            let payload = read_system_telemetry(
-                &node.club_node_id,
-                node.consensus.current_term,
-                node.consensus.committed_log_index,
-            );
+            let payload = {
+                let mut sys = state_for_telemetry.sysinfo_state.lock().unwrap();
+                let mut comps = state_for_telemetry.components_state.lock().unwrap();
+                read_system_telemetry(
+                    &node.club_node_id,
+                    node.consensus.current_term,
+                    node.consensus.committed_log_index,
+                    &mut sys,
+                    &mut comps,
+                )
+            };
             let msg = RailWebSocketMessage {
                 r#type: "Telemetry".to_string(),
-                payload,
+                payload: payload.clone(),
             };
             let _ = telemetry_tx_for_loop.send(msg);
+
+            // Update shared TUI state with American metrics
+            if let Ok(mut tui_lock) = shared_tui_state_for_telemetry.lock() {
+                tui_lock.telemetry = payload;
+                tui_lock.peer_count = node.consensus.peers.len();
+                tui_lock.dtn_queue_len = node.dtn_store.buffered_count();
+                tui_lock.dividend_rate = node.dividend_rate;
+            }
         }
     });
 
     // Background heartbeat / Raft audit loop (30s)
     let state_for_heartbeat = Arc::clone(&state);
+    let shared_tui_state_for_heartbeat = Arc::clone(&shared_tui_state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
             let node = state_for_heartbeat.home_node.read().await;
-            info!(
-                "Heartbeat: Node {} healthy | Raft Term: {} | Committed Index: {} | DTN Queue: {}",
+            let heartbeat_msg = format!(
+                "Heartbeat: Node {} healthy | Raft Term: {} | Committed Index: {} | Peers: {} | DTN Queue: {}",
                 node.club_node_id,
                 node.consensus.current_term,
                 node.consensus.committed_log_index,
+                node.consensus.peers.len(),
                 node.dtn_store.buffered_count()
             );
+            info!("{}", heartbeat_msg);
+
+            // Audit verification and update TUI logs
+            let audit_balanced = node.ledger.verify_audit_invariants().is_ok();
+            if let Ok(mut tui_lock) = shared_tui_state_for_heartbeat.lock() {
+                tui_lock.audit_balanced = audit_balanced;
+                tui_lock.log_messages.push(heartbeat_msg);
+                if tui_lock.log_messages.len() > 100 {
+                    tui_lock.log_messages.remove(0);
+                }
+            }
+
+            // Periodic auto-sync to SQLite disk
+            if std::path::Path::new("/app/data").exists() {
+                if let Err(e) = node.ledger.persist_to_sqlite("/app/data/atlantis_ledger.db") {
+                    error!("Failed to persist ledger to SQLite: {}", e);
+                }
+            }
         }
     });
+
+    // Create a broadcast channel for graceful shutdown
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     // Setup REST API Router on Port 8081
     let api_router = Router::new()
         .route("/api/audit/report", get(get_audit_report))
         .route("/api/marketplace/tasks", get(get_marketplace_tasks).post(post_create_task))
+        .route("/api/club/officers", get(get_club_officers))
+        .route("/api/club/graduate", axum::routing::post(post_graduate_initiate))
+        .route("/api/club/officers/assign", axum::routing::post(post_assign_role))
+        // Charter plugin routes for daemons in Nautilus office
+        .route("/api/charter/strategies", get(get_charter_strategies))
+        .route("/api/charter/strategy/toggle", axum::routing::post(post_toggle_charter_strategy))
+        .route("/api/charter/office/totem", axum::routing::post(post_charter_office_totem))
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
     let api_listener = tokio::net::TcpListener::bind("0.0.0.0:8081").await?;
     info!("Atlantis Double-Entry Ledger & Marketplace API listening on 0.0.0.0:8081");
 
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(api_listener, api_router).await {
+    let mut shutdown_rx_api = shutdown_tx.subscribe();
+    let api_handle = tokio::spawn(async move {
+        let server = axum::serve(api_listener, api_router);
+        if let Err(e) = server
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx_api.recv().await;
+            })
+            .await
+        {
             error!("API Server Error on port 8081: {}", e);
         }
     });
@@ -320,15 +555,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rail_listener = tokio::net::TcpListener::bind("0.0.0.0:9001").await?;
     info!("Atlantis OpenRaft Consensus & Execution Rail WS listening on 0.0.0.0:9001");
 
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(rail_listener, rail_router).await {
+    let mut shutdown_rx_rail = shutdown_tx.subscribe();
+    let rail_handle = tokio::spawn(async move {
+        let server = axum::serve(rail_listener, rail_router);
+        if let Err(e) = server
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx_rail.recv().await;
+            })
+            .await
+        {
             error!("Execution Rail WS Server Error on port 9001: {}", e);
         }
     });
 
-    // Wait for termination signal
-    tokio::signal::ctrl_c().await?;
-    info!("Received SIGINT/SIGTERM, shutting down Atlantis Home Node cleanly...");
+    // Launch interactive TUI if not in headless/daemon mode
+    let shutdown_tx_for_tui = shutdown_tx.clone();
+    let shared_tui_state_for_run = Arc::clone(&shared_tui_state);
+    if !is_headless {
+        std::thread::spawn(move || {
+            // Small warm up pause for server sockets to bind
+            std::thread::sleep(Duration::from_millis(150));
+            if let Err(e) = tui::run_tui(shared_tui_state_for_run) {
+                error!("TUI session terminated with error: {}", e);
+            }
+            let _ = shutdown_tx_for_tui.send(());
+        });
+    }
+
+    // Wait for termination signal or TUI quit
+    let mut shutdown_rx_main = shutdown_tx.subscribe();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT/SIGTERM, sending shutdown signal to servers...");
+            let _ = shutdown_tx.send(());
+        }
+        _ = shutdown_rx_main.recv() => {
+            info!("Shutdown event received, terminating node services...");
+        }
+    }
+
+    // Spool DTN queue to disk on shutdown
+    {
+        let node = state.home_node.read().await;
+        if let Err(e) = node.dtn_store.persist_to_disk(spool_file) {
+            tracing::warn!("Could not write DTN spool file on shutdown: {}", e);
+        } else {
+            info!("Spool state preserved to disk successfully.");
+        }
+    }
+
+    let _ = tokio::join!(api_handle, rail_handle);
+    info!("Atlantis Home Node shut down cleanly.");
 
     Ok(())
 }
