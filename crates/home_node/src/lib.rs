@@ -13,6 +13,12 @@ pub use episode_feed::*;
 pub mod fusion;
 pub use fusion::*;
 
+pub mod service_gate;
+pub use service_gate::*;
+
+pub mod app_baseline_merge;
+pub use app_baseline_merge::*;
+
 use ai_gate::LocalAiGate;
 use atlantis_protocol::{AtlantisAsset, JobCategory, KuroshioEventEnvelope, KuroshioEventPayload};
 use serde::{Deserialize, Serialize};
@@ -375,15 +381,30 @@ impl GoogleJwksVerifier {
         }
     }
 
-    /// Deterministically verifies a Google JWT token and derives the user's `did:atlantis:<hex>`
+    /// Deterministically verifies a Google JWT token structure and derives the user's `did:atlantis:<hex>`
     /// and Ed25519 session token.
+    /// Requires strict 3-part header.payload.signature JWS structure with non-empty cryptographic components.
     pub fn verify_and_bind_jwt(
         &self,
         jwt_token: &str,
     ) -> Result<VerifiedAtlantisSession, String> {
         let trimmed = jwt_token.trim();
-        if trimmed.is_empty() || !trimmed.contains('.') {
-            return Err("Invalid Google OAuth JWT format".to_string());
+        let parts: Vec<&str> = trimmed.split('.').collect();
+        if parts.len() != 3 {
+            return Err("Invalid Google OAuth JWT format: must contain header, payload, and cryptographic signature parts".to_string());
+        }
+
+        let header_b64 = parts[0];
+        let payload_b64 = parts[1];
+        let signature_b64 = parts[2];
+
+        if header_b64.is_empty() || payload_b64.is_empty() || signature_b64.is_empty() {
+            return Err("Invalid Google OAuth JWT format: empty token segments".to_string());
+        }
+
+        // Validate minimum cryptographic signature entropy (at least 32 bytes encoded)
+        if signature_b64.len() < 32 {
+            return Err("Invalid Google OAuth JWT: signature entropy insufficient".to_string());
         }
 
         let mut hasher = Sha256::new();
@@ -397,7 +418,7 @@ impl GoogleJwksVerifier {
         let session_token = format!("atlantis_sess_{}", &hex_pubkey[..32]);
 
         Ok(VerifiedAtlantisSession {
-            google_sub: trimmed.split('.').nth(1).unwrap_or("sub").to_string(),
+            google_sub: payload_b64.to_string(),
             did,
             session_token,
         })
@@ -490,20 +511,19 @@ impl ClubHomeNode {
             timestamp,
         )?;
 
-        let envelope = KuroshioEventEnvelope {
-            id: Uuid::new_v4(),
-            did: buyer_did,
-            club_node_id: self.club_node_id.clone(),
-            event: KuroshioEventPayload::TaskCreated {
-                job_id,
-                category,
-                budget_amount,
-                asset,
-                min_poh_score,
-            },
-            signature: "ed25519_signed_by_home_node".to_string(),
-            timestamp,
+        let event = KuroshioEventPayload::TaskCreated {
+            job_id,
+            category,
+            budget_amount,
+            asset,
+            min_poh_score,
         };
+
+        let envelope = self
+            .registry
+            .club_identity
+            .sign_event(&self.club_node_id, event, timestamp)
+            .map_err(|e| LedgerError::DatabaseError(format!("Signature generation failed: {}", e)))?;
 
         self.consensus.append_and_commit(envelope.clone());
 
@@ -531,18 +551,17 @@ impl ClubHomeNode {
             timestamp,
         )?;
 
-        let settlement_envelope = KuroshioEventEnvelope {
-            id: Uuid::new_v4(),
-            did: worker_did.clone(),
-            club_node_id: self.club_node_id.clone(),
-            event: KuroshioEventPayload::EscrowReleased {
-                escrow_id,
-                recipient_did: worker_did,
-                club_dividend: dividend_tx.amount,
-            },
-            signature: format!("ed25519_verified_proof_{}", proof_hash),
-            timestamp,
+        let event = KuroshioEventPayload::EscrowReleased {
+            escrow_id,
+            recipient_did: worker_did,
+            club_dividend: dividend_tx.amount,
         };
+
+        let settlement_envelope = self
+            .registry
+            .club_identity
+            .sign_event(&self.club_node_id, event, timestamp)
+            .map_err(|e| LedgerError::DatabaseError(format!("Signature generation failed: {}", e)))?;
 
         self.consensus.append_and_commit(settlement_envelope.clone());
 
@@ -694,11 +713,12 @@ mod tests {
     #[test]
     fn test_google_jwks_deterministic_did_binding() {
         let verifier = GoogleJwksVerifier::new("atlantis-prod-client-id");
+        let mock_jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFsaWNlIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         let s1 = verifier
-            .verify_and_bind_jwt("eyJhbGciOiJSUzI1NiJ9.user_payload_123.sig")
+            .verify_and_bind_jwt(mock_jwt)
             .expect("valid jwt");
         let s2 = verifier
-            .verify_and_bind_jwt("eyJhbGciOiJSUzI1NiJ9.user_payload_123.sig")
+            .verify_and_bind_jwt(mock_jwt)
             .expect("valid jwt");
 
         assert_eq!(s1, s2);

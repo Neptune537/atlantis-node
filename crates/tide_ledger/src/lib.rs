@@ -137,6 +137,7 @@ impl TideLedgerEngine {
     }
 
     /// Persists the current in-memory ledger state into a SQLite database.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn persist_to_sqlite(&self, db_path: &str) -> Result<(), LedgerError> {
         let conn = rusqlite::Connection::open(db_path)
             .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
@@ -206,6 +207,7 @@ impl TideLedgerEngine {
     }
 
     /// Loads the ledger state from an existing SQLite database.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_from_sqlite(db_path: &str) -> Result<Self, LedgerError> {
         let conn = rusqlite::Connection::open(db_path)
             .map_err(|e| LedgerError::DatabaseError(e.to_string()))?;
@@ -333,6 +335,39 @@ impl TideLedgerEngine {
         }
 
         Ok((worker_tx, dividend_tx))
+    }
+
+    /// Refunds a Coral Escrow Vault in full back to the original buyer upon contract expiry or cancellation.
+    pub fn refund_coral_escrow(
+        &mut self,
+        escrow_id: Uuid,
+        timestamp: u64,
+    ) -> Result<LedgerTransaction, LedgerError> {
+        let vault = self
+            .escrows
+            .get(&escrow_id)
+            .cloned()
+            .ok_or(LedgerError::InvalidEscrowState(escrow_id))?;
+
+        if vault.status != EscrowStatus::AuthorizedLocked {
+            return Err(LedgerError::InvalidEscrowState(escrow_id));
+        }
+
+        let refund_tx = self.record_double_entry(
+            LedgerTxType::EscrowRelease,
+            vault.job_id,
+            self.coral_vault_holding_account,
+            vault.buyer_account,
+            vault.asset,
+            vault.locked_amount,
+            timestamp,
+        )?;
+
+        if let Some(v) = self.escrows.get_mut(&escrow_id) {
+            v.status = EscrowStatus::Refunded;
+        }
+
+        Ok(refund_tx)
     }
 
     /// Settles an asynchronous compute job per PROP-0043:

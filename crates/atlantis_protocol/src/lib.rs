@@ -26,6 +26,12 @@ pub use episode_wire::*;
 pub mod lumeria_sdk;
 pub use lumeria_sdk::*;
 
+pub mod egress_guard;
+pub use egress_guard::*;
+
+pub mod sandbox_protocol;
+pub use sandbox_protocol::*;
+
 pub mod graduation_governance;
 pub use graduation_governance::*;
 
@@ -336,14 +342,35 @@ impl PearlEnclaveIdentity {
     }
 
     /// Generates a deterministic `PearlEnclaveIdentity` from a human-readable node label or phrase.
+    /// In production environments, callers should prefer `from_secure_enclave` or `generate_ephemeral`
+    /// to avoid deterministic key recovery from known labels.
     pub fn from_label(label: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"PEARL_ENCLAVE_SEED_V1:");
         hasher.update(label.as_bytes());
+        // Incorporate system entropy if available via OLYMPUS_ROOT_SALT or NODE_SALT
+        if let Ok(salt) = std::env::var("ATLANTIS_ENCLAVE_SALT") {
+            hasher.update(b":SALT:");
+            hasher.update(salt.as_bytes());
+        }
         let digest = hasher.finalize();
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&digest);
         Self::from_seed(seed)
+    }
+
+    /// Loads or derives an identity using hardware-backed / environment-seeded entropy.
+    pub fn from_secure_env(env_var_name: &str, default_label: &str) -> Self {
+        if let Ok(raw_key_hex) = std::env::var(env_var_name) {
+            if let Ok(bytes) = hex_to_bytes(&raw_key_hex) {
+                if bytes.len() == 32 {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&bytes);
+                    return Self::from_seed(seed);
+                }
+            }
+        }
+        Self::from_label(default_label)
     }
 
     /// Generates a fresh ephemeral identity using a random UUID v4 entropy source.

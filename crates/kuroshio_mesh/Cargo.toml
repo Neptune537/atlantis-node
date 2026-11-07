@@ -1,0 +1,19 @@
+[package]
+name = "kuroshio_mesh"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Browser-native WebRTC DataChannels, libp2p Gossipsub p2p mesh transport, and HTLC Escrow with Groth16 ZK-SNARK geofence settlements"
+
+[dependencies]
+atlantis_protocol = { path = "../atlantis_protocol" }
+tide_ledger = { path = "../tide_ledger" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+tokio = { workspace = true, features = ["full"] }

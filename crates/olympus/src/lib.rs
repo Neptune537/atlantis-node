@@ -92,7 +92,7 @@ impl Default for OlympusApexAuthority {
 impl OlympusApexAuthority {
     /// Initialize a new Olympus Apex Authority instance.
     pub fn new() -> Self {
-        let identity = PearlEnclaveIdentity::from_label("kuroshio:olympus:root");
+        let identity = PearlEnclaveIdentity::from_secure_env("OLYMPUS_ROOT_PRIVATE_KEY", "kuroshio:olympus:root");
         Self {
             identity,
             clock: MasterEpochClock::new(),

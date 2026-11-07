@@ -731,6 +731,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuroshio_mesh"
+version = "0.2.0"
+dependencies = [
+ "atlantis_protocol",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tide_ledger",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

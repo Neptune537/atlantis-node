@@ -13,6 +13,15 @@ use uuid::Uuid;
 
 pub const MDNS_SERVICE_TYPE: &str = "_atlantis-ai._tcp.local";
 
+pub mod stream_decode;
+pub use stream_decode::*;
+
+pub mod context_budget;
+pub use context_budget::*;
+
+pub mod openrouter_routing;
+pub use openrouter_routing::*;
+
 #[derive(Debug, Error)]
 pub enum AiGateError {
     #[error("Price tampering or prompt injection blocked for SKU {0}: proposed {1}, catalog price {2}")]

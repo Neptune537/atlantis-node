@@ -98,8 +98,32 @@ pub struct MonthlyStakeDripRequest {
     pub escrow_id: Uuid,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchDaemonApprovalRequest {
+    pub spec: home_node::DaemonServiceSpec,
+    pub officer_did: String,
+    pub auto_restart: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeStoreAppRequest {
+    pub baseline_files: std::collections::BTreeMap<String, String>,
+    pub local_files: std::collections::BTreeMap<String, String>,
+    pub upstream_files: std::collections::BTreeMap<String, String>,
+    pub strategy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeStoreAppResponse {
+    pub cleanly_merged_files: Vec<String>,
+    pub conflict_count: usize,
+    pub conflicts: Vec<home_node::MergeConflict>,
+    pub merged_files: std::collections::BTreeMap<String, Option<String>>,
+}
+
 pub struct AppState {
     pub home_node: RwLock<ClubHomeNode>,
+    pub service_gate: RwLock<home_node::ServiceApprovalGate>,
     pub telemetry_tx: broadcast::Sender<RailWebSocketMessage>,
     pub sysinfo_state: std::sync::Mutex<sysinfo::System>,
     pub components_state: std::sync::Mutex<sysinfo::Components>,
@@ -220,6 +244,74 @@ async fn post_create_task(
     }
 }
 
+async fn post_approve_daemon(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LaunchDaemonApprovalRequest>,
+) -> Result<Json<home_node::ServiceApprovalRecord>, (StatusCode, String)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut gate = state.service_gate.write().await;
+    let record = gate.approve_service(
+        &req.spec,
+        req.officer_did,
+        now,
+        req.auto_restart.unwrap_or(true),
+    );
+    info!("[Service Gate] Approved service {} with fingerprint {}", record.service_id, record.approved_fingerprint);
+    Ok(Json(record))
+}
+
+async fn post_verify_daemon_launch(
+    State(state): State<Arc<AppState>>,
+    Json(spec): Json<home_node::DaemonServiceSpec>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let gate = state.service_gate.read().await;
+    match gate.verify_launch(&spec) {
+        Ok(()) => Ok(Json(serde_json::json!({ "status": "authorized", "fingerprint": spec.compute_fingerprint() }))),
+        Err(e) => Err((StatusCode::FORBIDDEN, e.to_string())),
+    }
+}
+
+async fn post_3way_app_merge(
+    Json(req): Json<MergeStoreAppRequest>,
+) -> Result<Json<MergeStoreAppResponse>, (StatusCode, String)> {
+    let mut baseline = home_node::FileTree::new();
+    for (k, v) in req.baseline_files {
+        baseline.insert(k, v.into_bytes());
+    }
+    let mut mine = home_node::FileTree::new();
+    for (k, v) in req.local_files {
+        mine.insert(k, v.into_bytes());
+    }
+    let mut theirs = home_node::FileTree::new();
+    for (k, v) in req.upstream_files {
+        theirs.insert(k, v.into_bytes());
+    }
+
+    let strat = match req.strategy.as_deref() {
+        Some("mine") => home_node::MergeResolutionStrategy::KeepMine,
+        Some("theirs") => home_node::MergeResolutionStrategy::TakeTheirs,
+        _ => home_node::MergeResolutionStrategy::WriteConflictMarkers,
+    };
+
+    let outcome = home_node::merge_3way_trees(&baseline, &mine, &theirs, strat);
+
+    let mut merged_utf8 = std::collections::BTreeMap::new();
+    for (k, v) in outcome.files {
+        merged_utf8.insert(k, v.map(|bytes| String::from_utf8_lossy(&bytes).to_string()));
+    }
+
+    Ok(Json(MergeStoreAppResponse {
+        cleanly_merged_files: outcome.cleanly_merged_files,
+        conflict_count: outcome.conflicts.len(),
+        conflicts: outcome.conflicts,
+        merged_files: merged_utf8,
+    }))
+}
+
 async fn get_club_officers(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<home_node::OperativeRecord>> {
@@ -333,7 +425,13 @@ async fn post_provision_store_stake(
 
     let current_bal = node.ledger.balances.get(&req.node_account).copied().unwrap_or(0.0);
     if current_bal < req.annual_stake_usd {
-        node.ledger.seed_account(req.node_account, req.annual_stake_usd);
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            format!(
+                "Insufficient funds: account {} has ${:.2}, requires ${:.2} deposit before staking",
+                req.node_account, current_bal, req.annual_stake_usd
+            ),
+        ));
     }
     if !node.ledger.balances.contains_key(&req.network_pool_treasury) {
         node.ledger.seed_account(req.network_pool_treasury, 0.0);
@@ -523,6 +621,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         home_node: RwLock::new(home_node),
+        service_gate: RwLock::new(home_node::ServiceApprovalGate::new()),
         telemetry_tx: telemetry_tx.clone(),
         sysinfo_state: std::sync::Mutex::new(initial_sys),
         components_state: std::sync::Mutex::new(initial_components),
@@ -627,6 +726,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Store Node $12 Annual Stake and $1 Monthly Network Pool Drip
         .route("/api/store/provision-stake", axum::routing::post(post_provision_store_stake))
         .route("/api/store/monthly-drip", axum::routing::post(post_monthly_stake_drip))
+        // Daemon service fingerprinting & launch authorization
+        .route("/api/service/approve", axum::routing::post(post_approve_daemon))
+        .route("/api/service/verify", axum::routing::post(post_verify_daemon_launch))
+        // 3-way baseline app store merge
+        .route("/api/store/app/merge", axum::routing::post(post_3way_app_merge))
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
