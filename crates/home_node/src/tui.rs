@@ -25,6 +25,9 @@ pub struct TuiState {
     pub dividend_rate: f64,
     pub audit_balanced: bool,
     pub audit_reconciled: f64,
+    pub active_store_nodes: usize,
+    pub annual_stake_locked_usd: f64,
+    pub monthly_pool_drip_usd: f64,
 }
 
 impl Default for TuiState {
@@ -47,6 +50,9 @@ impl Default for TuiState {
             dividend_rate: 0.02,
             audit_balanced: true,
             audit_reconciled: 0.0,
+            active_store_nodes: 0,
+            annual_stake_locked_usd: 0.0,
+            monthly_pool_drip_usd: 0.0,
         }
     }
 }
@@ -266,6 +272,13 @@ fn render_dashboard(f: &mut Frame, state: &TuiState) {
         Row::new(vec![
             Span::raw("DTN Delayed Buffer:"),
             Span::styled(format!("{} spooled records", state.dtn_queue_len), Style::default().fg(Color::LightBlue)),
+        ]),
+        Row::new(vec![
+            Span::raw("Store Stake Pool:"),
+            Span::styled(
+                format!("{} Nodes | ${:.2} Locked | ${:.2}/mo Drip", state.active_store_nodes, state.annual_stake_locked_usd, state.monthly_pool_drip_usd),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
 

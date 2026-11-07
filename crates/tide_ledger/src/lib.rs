@@ -738,6 +738,102 @@ impl SubscriptionLedger {
 
         Ok(Some(tx))
     }
+
+    /// Provisions a 12-month Store Node Annual Stake ($12.00 via Google Pay / USDC)
+    /// and executes the initial Month 1 ($1.00) Network Pool Drip.
+    pub fn provision_google_pay_annual_node_stake(
+        &mut self,
+        ledger: &mut TideLedgerEngine,
+        node_account: Uuid,
+        network_pool_treasury: Uuid,
+        annual_stake_usd: f64,
+        timestamp: u64,
+    ) -> Result<(CoralEscrowVault, LedgerTransaction), LedgerError> {
+        if annual_stake_usd + 1e-9 < 12.0 {
+            return Err(LedgerError::InsufficientFunds(node_account, annual_stake_usd, 12.0));
+        }
+
+        // 1. Lock the $12.00 annual stake in Coral Escrow Vault
+        let stake_job_id = Uuid::new_v4();
+        let mut vault = ledger.lock_coral_escrow(
+            stake_job_id,
+            node_account,
+            network_pool_treasury,
+            AtlantisAsset::Usd,
+            annual_stake_usd,
+            timestamp,
+        )?;
+
+        // 2. Immediately drip Month 1 ($1.00) from the locked escrow into the Network Treasury Pool
+        let monthly_drip = self.engine.monthly_subscription_fee_usd;
+        let drip_tx = ledger.record_double_entry(
+            LedgerTxType::Subscription,
+            stake_job_id,
+            ledger.coral_vault_holding_account,
+            network_pool_treasury,
+            AtlantisAsset::Usd,
+            monthly_drip,
+            timestamp,
+        )?;
+
+        // Update remaining locked escrow balance ($11.00 remaining for Months 2..12)
+        if let Some(escrow) = ledger.escrows.get_mut(&vault.id) {
+            escrow.locked_amount -= monthly_drip;
+            vault = escrow.clone();
+        }
+
+        // Register active 365-day node subscription record
+        let year_seconds = 365 * 24 * 3600;
+        self.subscriptions.insert(
+            node_account,
+            SubscriptionRecord {
+                user_account: node_account,
+                staked_usd: annual_stake_usd,
+                active_until_timestamp: timestamp + year_seconds,
+                total_cyan_allocated: 0.0,
+            },
+        );
+
+        Ok((vault, drip_tx))
+    }
+
+    /// Executes a subsequent monthly $1.00 drip from the node's locked annual stake into the Network Treasury Pool.
+    pub fn drip_monthly_stake_to_network_pool(
+        &mut self,
+        ledger: &mut TideLedgerEngine,
+        escrow_id: Uuid,
+        timestamp: u64,
+    ) -> Result<LedgerTransaction, LedgerError> {
+        let vault = ledger
+            .escrows
+            .get(&escrow_id)
+            .cloned()
+            .ok_or(LedgerError::InvalidEscrowState(escrow_id))?;
+
+        let monthly_drip = self.engine.monthly_subscription_fee_usd;
+        if vault.status != EscrowStatus::AuthorizedLocked || vault.locked_amount + 1e-9 < monthly_drip {
+            return Err(LedgerError::InvalidEscrowState(escrow_id));
+        }
+
+        let drip_tx = ledger.record_double_entry(
+            LedgerTxType::Subscription,
+            vault.job_id,
+            ledger.coral_vault_holding_account,
+            vault.club_treasury_account,
+            vault.asset,
+            monthly_drip,
+            timestamp,
+        )?;
+
+        if let Some(escrow) = ledger.escrows.get_mut(&escrow_id) {
+            escrow.locked_amount = (escrow.locked_amount - monthly_drip).max(0.0);
+            if escrow.locked_amount < 1e-6 {
+                escrow.status = EscrowStatus::CompletedReleased;
+            }
+        }
+
+        Ok(drip_tx)
+    }
 }
 
 /// Summary report emitted by `TideLedgerEngine::verify_audit_invariants`.
@@ -1004,6 +1100,39 @@ mod tests {
             0.0
         );
 
+        assert!(ledger.verify_audit_invariants().is_ok());
+    }
+
+    #[test]
+    fn test_google_pay_annual_node_stake_and_monthly_pool_drip() {
+        let mut ledger = TideLedgerEngine::new();
+        let mut sub_ledger = SubscriptionLedger::new(&mut ledger, 10_000.0);
+        let store_node = Uuid::new_v4();
+        let network_pool = Uuid::new_v4();
+
+        // Store owner pays $12.00 via Google Pay for annual node stake
+        ledger.seed_account(store_node, 12.0);
+        ledger.seed_account(network_pool, 0.0);
+
+        let (vault, month1_tx) = sub_ledger
+            .provision_google_pay_annual_node_stake(&mut ledger, store_node, network_pool, 12.0, 1_700_000_000)
+            .expect("Google Pay $12 stake provisioning should succeed");
+
+        assert!((month1_tx.amount - 1.0).abs() < 1e-6);
+        assert!((vault.locked_amount - 11.0).abs() < 1e-6);
+        assert!((ledger.balances[&network_pool] - 1.0).abs() < 1e-6);
+        assert!(ledger.verify_audit_invariants().is_ok());
+
+        // Drip remaining 11 months ($1.00 each month)
+        for m in 2..=12 {
+            let tx = sub_ledger
+                .drip_monthly_stake_to_network_pool(&mut ledger, vault.id, 1_700_000_000 + m * 2_592_000)
+                .expect("Monthly drip should succeed");
+            assert!((tx.amount - 1.0).abs() < 1e-6);
+        }
+
+        assert!((ledger.balances[&network_pool] - 12.0).abs() < 1e-6);
+        assert!((ledger.balances[&ledger.coral_vault_holding_account]).abs() < 1e-6);
         assert!(ledger.verify_audit_invariants().is_ok());
     }
 }

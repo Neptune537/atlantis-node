@@ -81,6 +81,23 @@ pub struct UpdateRoleRequest {
     pub new_role: home_node::ClubOfficerRole,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionStoreStakeRequest {
+    pub node_account: Uuid,
+    pub network_pool_treasury: Uuid,
+    #[serde(default = "default_annual_stake")]
+    pub annual_stake_usd: f64,
+}
+
+fn default_annual_stake() -> f64 {
+    12.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonthlyStakeDripRequest {
+    pub escrow_id: Uuid,
+}
+
 pub struct AppState {
     pub home_node: RwLock<ClubHomeNode>,
     pub telemetry_tx: broadcast::Sender<RailWebSocketMessage>,
@@ -304,6 +321,78 @@ async fn post_charter_office_totem(
     }
 }
 
+async fn post_provision_store_stake(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ProvisionStoreStakeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut node = state.home_node.write().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_730_000_000);
+
+    let current_bal = node.ledger.balances.get(&req.node_account).copied().unwrap_or(0.0);
+    if current_bal < req.annual_stake_usd {
+        node.ledger.seed_account(req.node_account, req.annual_stake_usd);
+    }
+    if !node.ledger.balances.contains_key(&req.network_pool_treasury) {
+        node.ledger.seed_account(req.network_pool_treasury, 0.0);
+    }
+
+    let ClubHomeNode {
+        ref mut ledger,
+        ref mut subscription_ledger,
+        ..
+    } = *node;
+
+    match subscription_ledger.provision_google_pay_annual_node_stake(
+        ledger,
+        req.node_account,
+        req.network_pool_treasury,
+        req.annual_stake_usd,
+        now,
+    ) {
+        Ok((vault, drip_tx)) => {
+            let pool_bal = ledger.balances.get(&req.network_pool_treasury).copied().unwrap_or(0.0);
+            Ok(Json(serde_json::json!({
+                "status": "PROVISIONED",
+                "escrow_vault_id": vault.id,
+                "locked_amount_usd": vault.locked_amount,
+                "month_1_drip_tx": drip_tx.id,
+                "network_pool_balance_usd": pool_bal
+            })))
+        }
+        Err(e) => Err((StatusCode::BAD_REQUEST, format!("Stake provisioning failed: {}", e))),
+    }
+}
+
+async fn post_monthly_stake_drip(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MonthlyStakeDripRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut node = state.home_node.write().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_730_000_000);
+
+    let ClubHomeNode {
+        ref mut ledger,
+        ref mut subscription_ledger,
+        ..
+    } = *node;
+
+    match subscription_ledger.drip_monthly_stake_to_network_pool(ledger, req.escrow_id, now) {
+        Ok(tx) => Ok(Json(serde_json::json!({
+            "status": "DRIPPED",
+            "transaction_id": tx.id,
+            "drip_amount_usd": tx.amount,
+            "destination_treasury": tx.credit_account
+        }))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, format!("Monthly drip failed: {}", e))),
+    }
+}
+
 async fn ws_execution_rail_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -471,6 +560,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tui_lock.peer_count = node.consensus.peers.len();
                 tui_lock.dtn_queue_len = node.dtn_store.buffered_count();
                 tui_lock.dividend_rate = node.dividend_rate;
+                tui_lock.active_store_nodes = node.subscription_ledger.subscriptions.len();
+                tui_lock.annual_stake_locked_usd = node
+                    .ledger
+                    .escrows
+                    .values()
+                    .filter(|v| v.status == tide_ledger::EscrowStatus::AuthorizedLocked)
+                    .map(|v| v.locked_amount)
+                    .sum();
+                tui_lock.monthly_pool_drip_usd = node.subscription_ledger.subscriptions.len() as f64 * node.subscription_ledger.engine.monthly_subscription_fee_usd;
             }
         }
     });
@@ -526,6 +624,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/charter/strategies", get(get_charter_strategies))
         .route("/api/charter/strategy/toggle", axum::routing::post(post_toggle_charter_strategy))
         .route("/api/charter/office/totem", axum::routing::post(post_charter_office_totem))
+        // Store Node $12 Annual Stake and $1 Monthly Network Pool Drip
+        .route("/api/store/provision-stake", axum::routing::post(post_provision_store_stake))
+        .route("/api/store/monthly-drip", axum::routing::post(post_monthly_stake_drip))
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 

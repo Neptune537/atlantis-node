@@ -6,3 +6,5 @@
 .env.*
 !.env.example
 *.log
+provisioned_nodes/
+*.tar.gz

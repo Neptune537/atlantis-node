@@ -422,6 +422,8 @@ pub struct ClubHomeNode {
     pub siren_radio_daemon: FortressTheaterService,
     /// Charter Quantitative Trading & Multi-Agent Strategy Plugin for Team 7 Nautilus office.
     pub charter_plugin: CharterNodeService,
+    /// Sovereign subscription ledger managing annual store node stakes and monthly drips.
+    pub subscription_ledger: tide_ledger::SubscriptionLedger,
 }
 
 impl ClubHomeNode {
@@ -430,6 +432,7 @@ impl ClubHomeNode {
         let mut ledger = TideLedgerEngine::new();
         let club_treasury_account = Uuid::new_v4();
         ledger.seed_account(club_treasury_account, 0.0);
+        let subscription_ledger = tide_ledger::SubscriptionLedger::new(&mut ledger, 100_000.0);
         let club_identity = PearlEnclaveIdentity::from_label(&format!("club-identity-{}", node_id_str));
         let registry = ClubHomeNodeRegistry::new(&node_id_str, club_identity);
         let siren_radio_daemon = FortressTheaterService::new(
@@ -461,6 +464,7 @@ impl ClubHomeNode {
             crowd_fusion: CrowdRadarFusionEngine::default(),
             siren_radio_daemon,
             charter_plugin,
+            subscription_ledger,
         }
     }
 
