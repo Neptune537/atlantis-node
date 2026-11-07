@@ -1,0 +1,50 @@
+name: Cross-Compile Atlantis Pi Node (aarch64)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-aarch64:
+    name: Build & Release aarch64 Binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cross-compile home_node for aarch64-unknown-linux-musl
+        run: |
+          cd crates/home_node
+          cross build --release --target aarch64-unknown-linux-musl
+
+      - name: Stage Artifacts
+        run: |
+          mkdir -p release-dist
+          cp target/aarch64-unknown-linux-musl/release/home_node release-dist/atlantis-node-aarch64
+          chmod +x release-dist/atlantis-node-aarch64
+          cd release-dist
+          sha256sum atlantis-node-aarch64 > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release-dist/atlantis-node-aarch64
+            release-dist/SHA256SUMS
+          draft: false
+          prerelease: false
