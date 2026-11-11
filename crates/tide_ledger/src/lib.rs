@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod privacy_pool;
+pub use privacy_pool::{AtlantisPrivacyPool, PrivacyDepositNote, PrivacyPoolError, PrivacyPoolManager, ZkWithdrawProof};
+
 #[derive(Debug, Error)]
 pub enum LedgerError {
     #[error("Insufficient balance in account {0}: available {1}, required {2}")]

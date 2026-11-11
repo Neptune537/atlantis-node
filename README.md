@@ -68,6 +68,10 @@ curl -sSL https://raw.githubusercontent.com/Neptune537/atlantis-node/master/scri
 
 ---
 
+## Economy design
+
+For gameplay currencies, CYAN, Google-linked wallets, and the club treasury rollout, see the [CYAN economy proposal](CYAN_ECONOMY_PROPOSAL.md). It distinguishes the models in this checkout from deployed financial features.
+
 ## 🛠️ Building From Source
 
 ### Prerequisites
