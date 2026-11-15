@@ -294,6 +294,31 @@ async fn post_approve_daemon(
     Ok(Json(record))
 }
 
+async fn get_service_schema() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "DaemonServiceSpec",
+        "description": "Deterministic launch specification for background daemons under Chrysalis & Home Node supervision",
+        "type": "object",
+        "required": [
+            "service_id",
+            "command",
+            "working_dir",
+            "setup_steps",
+            "env_vars",
+            "ready_probe_url_or_path"
+        ],
+        "properties": {
+            "service_id": { "type": "string", "description": "Unique identifier for the daemon" },
+            "command": { "type": "string", "description": "Shell command to launch the daemon" },
+            "working_dir": { "type": "string", "description": "Working directory from which to launch" },
+            "setup_steps": { "type": "array", "items": { "type": "string" }, "description": "Commands to execute prior to launch" },
+            "env_vars": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment key-values" },
+            "ready_probe_url_or_path": { "type": "string", "description": "HTTP health URL or file path indicating daemon readiness" }
+        }
+    }))
+}
+
 async fn post_verify_daemon_launch(
     State(state): State<Arc<AppState>>,
     Json(spec): Json<home_node::DaemonServiceSpec>,
@@ -873,6 +898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/store/provision-stake", axum::routing::post(post_provision_store_stake))
         .route("/api/store/monthly-drip", axum::routing::post(post_monthly_stake_drip))
         // Daemon service fingerprinting & launch authorization
+        .route("/api/service/schema", get(get_service_schema))
         .route("/api/service/approve", axum::routing::post(post_approve_daemon))
         .route("/api/service/verify", axum::routing::post(post_verify_daemon_launch))
         // 3-way baseline app store merge
