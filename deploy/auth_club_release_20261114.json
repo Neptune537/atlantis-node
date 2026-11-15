@@ -1,0 +1,30 @@
+{
+  "verified_at_utc": "2026-11-14T13:07:01Z",
+  "host": "zero@10.0.0.60",
+  "release": "/home/zero/atlantis-auth/releases/20261113-club",
+  "auth_binary_sha256": "77d8a030c432b80ba37204e61ca638a0f97bbbd8a7285f2c09690bb893d29248",
+  "auth_container": "atlantis-auth-api",
+  "rollback_container": "atlantis-auth-api-before-club",
+  "session_database": "/home/zero/atlantis-auth/data/auth-sessions.sqlite",
+  "database_backup": "/home/zero/atlantis-auth/data/auth-sessions.before-club-20261113.sqlite",
+  "tunnel_config_backup": "/home/zero/.cloudflared/config.before-club-20261113.yml",
+  "club_ingress": "^/api/auth/club/(presence|leave|messages)$ -> http://127.0.0.1:8087",
+  "public_checks": {
+    "play_https": 200,
+    "lite_https": 200,
+    "auth_me_without_bearer": 401,
+    "club_presence_without_bearer": 401,
+    "club_messages_without_bearer": 401,
+    "club_allowed_preflight": 200,
+    "club_untrusted_origin": 403,
+    "radio_head": 200,
+    "sonar_signed_frame_both_origins": true
+  },
+  "client_script_sha256": "1654c4d5bf6c54c09ea3e1aca7a9c21e128ca67a6248145d62e79783eec1da34",
+  "play_deployment": "https://play.tr7n7t7.com/",
+  "lite_deployment": "https://22e193e9.heavenlybound-lite.pages.dev",
+  "two_test_sessions": "Isolated canary database only; presence, chat, leave and posting guard passed; test rows removed",
+  "real_google_two_account_acceptance": false,
+  "individual_player_globe_coordinates": false,
+  "android_quest_acceptance": false
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=Atlantis Car Sentry & Off-Grid RF Sentry Daemon
+After=network.target gpsd.service
+Wants=gpsd.service
+
+[Service]
+Type=simple
+User=zero
+WorkingDirectory=/home/zero/atlantis
+Environment=VEHICLE_ID=kuroshio-prototype-01
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/car_sentry
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

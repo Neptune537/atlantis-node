@@ -1,0 +1,18 @@
+[package]
+name = "tr7n7t7_car_sentry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "TR7N7T7 Solar SenseCAP Car Sentry: 915MHz LoRa RF Anti-Theft Daemon with Bluetooth Proximity, Accelerometer Tamper & Nautilus ECEF Telemetry"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+atlantis_protocol = { path = "../atlantis_protocol" }
+
+[[bin]]
+name = "tr7n7t7-car-sentry"
+path = "src/main.rs"

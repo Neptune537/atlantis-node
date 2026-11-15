@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Atlantis & Siren Commercial Radio: 1-Click Store Node Provisioner (Linux / RPi)
+# TR7N7T7 Commercial Radio & Hardware Nodes: 1-Click Store Node Provisioner (Linux / RPi)
 # Supports:
 #   - Tier 1: $100 Compact Radio Node
 #   - Tier 2: $150 Pro Commercial Radio & AI Jingle Node
@@ -20,20 +20,20 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo -e "${CYAN}======================================================================${NC}"
-echo -e "${GREEN}>> Provisioning Atlantis Commercial Radio & Home Node Appliance${NC}"
+echo -e "${GREEN}>> Provisioning TR7N7T7 Commercial Radio & Hardware Node Appliance${NC}"
 echo -e "   Store Slug     : ${YELLOW}${STORE_SLUG}${NC}"
 echo -e "   Hardware Tier  : ${YELLOW}${NODE_TIER}${NC}"
 echo -e "   Audio Output   : ${YELLOW}${AUDIO_OUT}${NC}"
 echo -e "   Crankk DePIN   : ${YELLOW}${ENABLE_CRANKK}${NC}"
 echo -e "${CYAN}======================================================================${NC}"
 
-CONFIG_DIR="/etc/atlantis"
-DATA_DIR="/var/lib/atlantis/data"
-RADIO_CACHE_DIR="/var/lib/atlantis/radio_cache"
+CONFIG_DIR="/etc/tr7n7t7"
+DATA_DIR="/var/lib/tr7n7t7/data"
+RADIO_CACHE_DIR="/var/lib/tr7n7t7/radio_cache"
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$RADIO_CACHE_DIR"
 
 # 1. Generate unique Pearl Enclave DID & Store Provisioning Manifest
-NODE_DID="did:atlantis:node:${STORE_SLUG}-$(date +%s)"
+NODE_DID="did:tr7n7t7:node:${STORE_SLUG}-$(date +%s)"
 cat << EOF > "${CONFIG_DIR}/node_manifest.json"
 {
   "store_slug": "${STORE_SLUG}",
@@ -72,7 +72,7 @@ if command -v amixer >/dev/null 2>&1; then
 fi
 
 # 3. Install Systemd Service for 24/7 Zero-Dead-Air In-Store Radio Player
-cat << 'EOF' > /usr/local/bin/atlantis-radio-loop.sh
+cat << 'EOF' > /usr/local/bin/tr7n7t7-radio-loop.sh
 #!/usr/bin/env bash
 STREAM_URL="http://127.0.0.1:8080/live.mp3"
 CACHE_DIR="/var/lib/atlantis/radio_cache"
@@ -87,16 +87,16 @@ while true; do
     fi
 done
 EOF
-chmod +x /usr/local/bin/atlantis-radio-loop.sh
+chmod +x /usr/local/bin/tr7n7t7-radio-loop.sh
 
 cat << EOF > /etc/systemd/system/siren-instore-player.service
 [Unit]
-Description=Atlantis 24/7 In-Store Commercial Radio Output (Zero Dead-Air)
+Description=TR7N7T7 24/7 In-Store Commercial Radio Output (Zero Dead-Air)
 After=network-online.target sound.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/atlantis-radio-loop.sh
+ExecStart=/usr/local/bin/tr7n7t7-radio-loop.sh
 Restart=always
 RestartSec=3
 
@@ -112,6 +112,22 @@ if [ "$ENABLE_CRANKK" = "true" ]; then
 DEPIN_CPU_QUOTA="25%"
 DEPIN_MEMORY_LIMIT="512m"
 EOF
+fi
+
+
+# 5. Raspberry Pi Touchscreen / HDMI Screen Demo Kiosk (TR7N7T7 Visual HUD)
+if [ -f /etc/systemd/system/tr7n7t7-kiosk.service ] || command -v chromium-browser >/dev/null 2>&1; then
+    echo -e ">> Setting up TR7N7T7 Screen Demo Kiosk Mode..."
+    cat << 'EOF' > /usr/local/bin/tr7n7t7-screen-kiosk.sh
+#!/usr/bin/env bash
+xset -dpms || true
+xset s off || true
+xset s noblank || true
+unclutter -idle 0.5 -root &
+# Launch TR7N7T7 3D Digital Twin and In-Store Player in fullscreen kiosk mode on the Pi screen
+chromium-browser --noerrdialogs --disable-infobars --kiosk --autoplay-policy=no-user-gesture-required "https://heavenlysent-680ac.web.app?venue=atlantis&store=1&mode=kiosk"
+EOF
+    chmod +x /usr/local/bin/tr7n7t7-screen-kiosk.sh
 fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true

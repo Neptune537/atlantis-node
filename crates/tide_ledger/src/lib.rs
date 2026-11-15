@@ -7,11 +7,15 @@
 
 use atlantis_protocol::AtlantisAsset;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub mod privacy_pool;
+/// Opt-in integer, asset-isolated staging engine. Legacy databases are not auto-migrated.
+pub mod v2;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod durable;
 pub use privacy_pool::{AtlantisPrivacyPool, PrivacyDepositNote, PrivacyPoolError, PrivacyPoolManager, ZkWithdrawProof};
 
 #[derive(Debug, Error)]
@@ -22,6 +26,8 @@ pub enum LedgerError {
     AccountNotFound(Uuid),
     #[error("Escrow vault not found or already settled: {0}")]
     InvalidEscrowState(Uuid),
+    #[error("Invalid transfer or deposit amount {0}: must be finite and positive")]
+    InvalidAmount(f64),
     #[error("Audit invariant violated: debits and credits do not balance")]
     AuditInvariantViolation,
     #[error("Database error: {0}")]
@@ -97,7 +103,7 @@ impl TideLedgerEngine {
         }
     }
 
-    /// Credits initial fiat/token deposit into an account via a double-entry reserve entry.
+    /// Sets an opening balance for bootstrap/testing; this is not a journaled deposit.
     pub fn seed_account(&mut self, account_id: Uuid, initial_balance: f64) {
         self.balances.insert(account_id, initial_balance);
     }
@@ -113,11 +119,24 @@ impl TideLedgerEngine {
         amount: f64,
         timestamp: u64,
     ) -> Result<LedgerTransaction, LedgerError> {
+        if !amount.is_finite() || amount <= 0.0 {
+            return Err(LedgerError::InvalidAmount(amount));
+        }
+        if debit_account == credit_account {
+            return Err(LedgerError::AuditInvariantViolation);
+        }
         let sender_bal = *self
             .balances
             .get(&debit_account)
             .ok_or(LedgerError::AccountNotFound(debit_account))?;
 
+        let recipient_bal = self.balances.get(&credit_account).copied().unwrap_or(0.0);
+        if !sender_bal.is_finite() || sender_bal < 0.0
+            || !recipient_bal.is_finite() || recipient_bal < 0.0
+            || !(recipient_bal + amount).is_finite()
+        {
+            return Err(LedgerError::AuditInvariantViolation);
+        }
         if sender_bal < amount {
             return Err(LedgerError::InsufficientFunds(debit_account, sender_bal, amount));
         }
@@ -557,9 +576,15 @@ impl TideLedgerEngine {
     pub fn verify_audit_invariants(&self) -> Result<AuditInvariantReport, LedgerError> {
         let mut total_debits = 0.0_f64;
         let mut total_credits = 0.0_f64;
+        let mut seen_transactions = HashSet::new();
 
         for tx in &self.transactions {
-            if tx.amount < 0.0 || !tx.amount.is_finite() {
+            if tx.amount <= 0.0 || !tx.amount.is_finite()
+                || tx.debit_account == tx.credit_account
+                || !seen_transactions.insert(tx.id)
+                || !self.balances.contains_key(&tx.debit_account)
+                || !self.balances.contains_key(&tx.credit_account)
+            {
                 return Err(LedgerError::AuditInvariantViolation);
             }
             total_debits += tx.amount;
@@ -582,6 +607,11 @@ impl TideLedgerEngine {
             .filter(|v| v.status == EscrowStatus::AuthorizedLocked)
             .map(|v| v.locked_amount)
             .sum();
+        if self.escrows.values().any(|v| !v.locked_amount.is_finite()
+            || v.locked_amount < 0.0
+            || (v.status == EscrowStatus::AuthorizedLocked && v.locked_amount == 0.0)) {
+            return Err(LedgerError::AuditInvariantViolation);
+        }
 
         let holding_balance = *self
             .balances
@@ -1013,6 +1043,36 @@ mod tests {
         let report_final = ledger.verify_audit_invariants().expect("invariants valid after release");
         assert!(report_final.invariants_passed);
         assert_eq!(report_final.total_transactions, 3);
+    }
+
+    #[test]
+    fn audit_rejects_corrupt_transaction_identity_and_escrow() {
+        let mut ledger = TideLedgerEngine::new();
+        let sender = Uuid::new_v4();
+        let receiver = Uuid::new_v4();
+        ledger.seed_account(sender, 10.0);
+        ledger.seed_account(receiver, 0.0);
+        let tx = ledger.record_double_entry(LedgerTxType::Stake, Uuid::new_v4(),
+            sender, receiver, AtlantisAsset::Usdc, 2.0, 1).unwrap();
+        assert!(ledger.verify_audit_invariants().is_ok());
+
+        ledger.transactions.push(tx.clone());
+        assert!(ledger.verify_audit_invariants().is_err(), "duplicate transaction ID");
+        ledger.transactions.pop();
+        ledger.transactions[0].credit_account = sender;
+        assert!(ledger.verify_audit_invariants().is_err(), "self transfer");
+        ledger.transactions[0].credit_account = receiver;
+        ledger.transactions[0].amount = 0.0;
+        assert!(ledger.verify_audit_invariants().is_err(), "zero amount");
+        ledger.transactions[0].amount = tx.amount;
+        ledger.balances.insert(receiver, f64::NAN);
+        assert!(ledger.verify_audit_invariants().is_err(), "non-finite balance");
+        ledger.balances.insert(receiver, 2.0);
+        let vault = ledger.lock_coral_escrow(Uuid::new_v4(), sender, receiver,
+            AtlantisAsset::Usdc, 1.0, 2).unwrap();
+        assert!(ledger.verify_audit_invariants().is_ok());
+        ledger.escrows.get_mut(&vault.id).unwrap().locked_amount = f64::NAN;
+        assert!(ledger.verify_audit_invariants().is_err(), "non-finite escrow");
     }
 
     #[test]

@@ -1,0 +1,9 @@
+# Insert before the existing tr7n7t7.com static-site rule.
+# Keep all radio, Sonar, SSH and catch-all rules intact.
+ingress:
+  - hostname: tr7n7t7.com
+    path: ^/api/auth/club/(presence|leave|messages)$
+    service: http://127.0.0.1:8087
+  - hostname: tr7n7t7.com
+    path: ^/api/auth/(oidc|me|logout|wallet-challenge|link-wallet|align|jwks-sync)$
+    service: http://127.0.0.1:8087

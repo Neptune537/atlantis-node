@@ -8,6 +8,7 @@ members = [
     "crates/solana_programs",
     "crates/olympus",
     "crates/kuroshio_mesh",
+    "crates/tr7n7t7_car_sentry",
 ]
 
 [workspace.package]

@@ -176,6 +176,55 @@ pub struct AsynchronousExecutionReceipt {
     pub signature: Vec<u8>,
 }
 
+impl AsynchronousExecutionReceipt {
+    /// Computes the canonical SHA-256 digest over `(job_id, worker_did, output_data_uri, output_merkle_root, execution_duration_ms)`.
+    pub fn canonical_signing_digest(&self) -> [u8; 32] {
+        Self::compute_digest(
+            &self.job_id,
+            &self.worker_did,
+            &self.output_data_uri,
+            &self.output_merkle_root,
+            self.execution_duration_ms,
+        )
+    }
+
+    pub fn compute_digest(
+        job_id: &Uuid,
+        worker_did: &str,
+        output_data_uri: &str,
+        output_merkle_root: &[u8; 32],
+        execution_duration_ms: u64,
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"ASYNC_EXECUTION_RECEIPT_V1:");
+        hasher.update(job_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(worker_did.as_bytes());
+        hasher.update(b":");
+        hasher.update(output_data_uri.as_bytes());
+        hasher.update(b":");
+        hasher.update(output_merkle_root);
+        hasher.update(b":");
+        hasher.update(execution_duration_ms.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Verifies the receipt's 64-byte Ed25519 signature against `worker_did` (`did:atlantis:<64_hex_pubkey>`).
+    pub fn verify_signature(&self) -> bool {
+        let verifying_key = match PearlEnclaveIdentity::verifying_key_from_did(&self.worker_did) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+        let sig_array: [u8; 64] = match self.signature.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        };
+        let signature = Signature::from_bytes(&sig_array);
+        let digest = self.canonical_signing_digest();
+        verifying_key.verify(&digest, &signature).is_ok()
+    }
+}
+
 /// Marketplace & Real-World service job categories.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JobCategory {
@@ -467,6 +516,30 @@ impl PearlEnclaveIdentity {
     pub fn verify_envelope(envelope: &KuroshioEventEnvelope) -> bool {
         envelope.verify_signature()
     }
+
+    /// Signs a raw 32-byte digest with this identity's Ed25519 signing key.
+    pub fn sign_raw_digest(&self, digest: &[u8; 32]) -> [u8; 64] {
+        let signature: Signature = self.signing_key.sign(digest);
+        signature.to_bytes()
+    }
+
+    /// Verifies a hex-encoded 64-byte Ed25519 signature over a raw 32-byte digest against a `did:atlantis:<64_hex_pubkey>`.
+    pub fn verify_raw_digest(did: &str, digest: &[u8; 32], signature_hex: &str) -> bool {
+        let verifying_key = match Self::verifying_key_from_did(did) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+        let sig_bytes = match hex_to_bytes(signature_hex) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let sig_array: [u8; 64] = match sig_bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        };
+        let signature = Signature::from_bytes(&sig_array);
+        verifying_key.verify(digest, &signature).is_ok()
+    }
 }
 
 // ============================================================================
@@ -711,6 +784,17 @@ impl PohCanaryChallenge {
         execution_time_ms: u32,
     ) -> PohCanaryResponse {
         let result_digest_hex = self.compute_expected_digest();
+        self.sign_computed_result(worker_identity, result_digest_hex, execution_time_ms)
+    }
+
+    /// Signs a digest already computed by the worker so the edge can time the
+    /// actual challenge without running it a second time.
+    pub fn sign_computed_result(
+        &self,
+        worker_identity: &PearlEnclaveIdentity,
+        result_digest_hex: String,
+        execution_time_ms: u32,
+    ) -> PohCanaryResponse {
         let signing_bytes = Self::response_signing_digest(
             &self.challenge_id,
             worker_identity.did(),
@@ -978,9 +1062,20 @@ mod tests {
         let honest_response = challenge.solve(&worker, 18);
         assert!(challenge.verify_response(&honest_response));
 
+        // The configured deadline is inclusive; latency is signed but reported
+        // by the worker, so this is not a network round-trip measurement.
+        assert!(challenge.verify_response(&challenge.solve(&worker, 50)));
+        let mut altered_latency = honest_response.clone();
+        altered_latency.execution_time_ms = 19;
+        assert!(!challenge.verify_response(&altered_latency));
+
         // Exceeded latency budget (75ms > 50ms) -> fails audit
         let slow_response = challenge.solve(&worker, 75);
         assert!(!challenge.verify_response(&slow_response));
+
+        let edge_budget = PohCanaryChallenge::new(worker.did(), 64, 250, 1_700_000_101);
+        assert!(edge_budget.verify_response(&edge_budget.solve(&worker, 250)));
+        assert!(!edge_budget.verify_response(&edge_budget.solve(&worker, 251)));
 
         // Spoofed digest output -> fails audit
         let mut spoofed_response = honest_response.clone();

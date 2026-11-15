@@ -8,3 +8,10 @@
 *.log
 provisioned_nodes/
 *.tar.gz
+
+# Private runtime authentication state
+/data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

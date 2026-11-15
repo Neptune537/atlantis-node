@@ -16,7 +16,13 @@ pub use fusion::*;
 pub mod service_gate;
 pub use service_gate::*;
 
+pub mod car_sentry;
+pub use car_sentry::*;
+
+pub mod sessions;
+pub mod floor_one;
 pub mod app_baseline_merge;
+pub mod kuroshio_server;
 pub use app_baseline_merge::*;
 
 use ai_gate::LocalAiGate;
@@ -359,39 +365,312 @@ impl DtnBundleStore {
     }
 }
 
-/// Verified session binding returned by `GoogleJwksVerifier`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifiedAtlantisSession {
-    pub google_sub: String,
-    pub did: String,
-    pub session_token: String,
+/// Supported consumer OAuth / OIDC identity providers for Kuroshio Gyre onboarding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OidcProvider {
+    Google,
+    Apple,
 }
 
-/// Verifies incoming Google OAuth JWT tokens and binds them deterministically
-/// to a `did:atlantis:` identifier and session token.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GoogleJwksVerifier {
-    pub expected_client_id: String,
-}
-
-impl GoogleJwksVerifier {
-    pub fn new(expected_client_id: impl Into<String>) -> Self {
-        Self {
-            expected_client_id: expected_client_id.into(),
+impl OidcProvider {
+    pub fn canonical_issuer(&self) -> &'static str {
+        match self {
+            Self::Google => "https://accounts.google.com",
+            Self::Apple => "https://appleid.apple.com",
         }
     }
 
-    /// Deterministically verifies a Google JWT token structure and derives the user's `did:atlantis:<hex>`
-    /// and Ed25519 session token.
-    /// Requires strict 3-part header.payload.signature JWS structure with non-empty cryptographic components.
+    pub fn from_issuer(iss: &str) -> Result<Self, String> {
+        match iss {
+            "https://accounts.google.com" | "accounts.google.com" => Ok(Self::Google),
+            "https://appleid.apple.com" | "appleid.apple.com" => Ok(Self::Apple),
+            other => Err(format!("Unsupported OIDC issuer: '{}'", other)),
+        }
+    }
+}
+
+/// Decodes a Base64URL-encoded string (RFC 4648 §5, with or without padding) into raw bytes.
+pub fn decode_base64url(input: &str) -> Result<Vec<u8>, String> {
+    let trimmed = input.trim().trim_end_matches('=');
+    let mut buffer = Vec::with_capacity(trimmed.len() * 3 / 4);
+    let mut accum: u32 = 0;
+    let mut bits: u8 = 0;
+
+    for ch in trimmed.bytes() {
+        let val: u8 = match ch {
+            b'A'..=b'Z' => ch - b'A',
+            b'a'..=b'z' => ch - b'a' + 26,
+            b'0'..=b'9' => ch - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => return Err(format!("Invalid Base64URL character: '{}'", ch as char)),
+        };
+        accum = (accum << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            buffer.push(((accum >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(buffer)
+}
+
+/// Verified session binding returned by `GoogleJwksVerifier` (supporting both Google and Apple ID OIDC).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedAtlantisSession {
+    pub provider: OidcProvider,
+    pub issuer: String,
+    pub subject: String,
+    /// Legacy alias for compatibility with callers inspecting `google_sub`.
+    pub google_sub: String,
+    pub did: String,
+    pub session_token: String,
+    pub expires_at_s: u64,
+    pub linked_solana_wallet: Option<String>,
+}
+
+/// Expiring one-time challenge used to cryptographically bind a self-custody Solana wallet
+/// to an authenticated Apple ID or Google Atlantis principal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SolanaWalletLinkChallenge {
+    pub principal_did: String,
+    pub wallet_pubkey_hex: String,
+    pub nonce: String,
+    pub issued_at_s: u64,
+    pub expires_at_s: u64,
+}
+
+impl SolanaWalletLinkChallenge {
+    /// Constructs the exact canonical ASCII message that the user's Solana wallet signs.
+    pub fn signing_message(&self) -> String {
+        format!(
+            "KUROSHIO_GYRE_WALLET_LINK_V1\ndid:{}\nwallet:{}\nnonce:{}\nexpires:{}",
+            self.principal_did, self.wallet_pubkey_hex, self.nonce, self.expires_at_s
+        )
+    }
+
+    /// Verifies the wallet's Ed25519 signature over `signing_message()` and checks expiry.
+    pub fn verify_wallet_signature(
+        &self,
+        signature_hex: &str,
+        current_time_s: u64,
+    ) -> Result<(), String> {
+        if current_time_s > self.expires_at_s {
+            return Err("Wallet link challenge has expired".to_string());
+        }
+        let target_did = format!("did:atlantis:{}", self.wallet_pubkey_hex);
+        let verifying_key = PearlEnclaveIdentity::verifying_key_from_did(&target_did)
+            .map_err(|e| format!("Invalid Solana wallet public key: {}", e))?;
+        let sig_bytes = atlantis_protocol::hex_to_bytes(signature_hex)
+            .map_err(|e| format!("Invalid signature hex: {}", e))?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| "Solana Ed25519 signature must be 64 bytes".to_string())?;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        use ed25519_dalek::Verifier;
+        verifying_key
+            .verify(self.signing_message().as_bytes(), &sig)
+            .map_err(|_| "Solana wallet Ed25519 signature verification failed".to_string())
+    }
+}
+
+/// JSON Web Key (JWK) descriptor fetched from Google (`https://www.googleapis.com/oauth2/v3/certs`)
+/// or Apple ID (`https://appleid.apple.com/auth/keys`) JWKS endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcJwkKey {
+    pub kid: String,
+    pub kty: String,
+    pub alg: String,
+    #[serde(rename = "use", default)]
+    pub key_use: Option<String>,
+    /// Base64URL modulus (`RSA`) or public key (`OKP`/`EC`).
+    #[serde(default)]
+    pub n: Option<String>,
+    #[serde(default)]
+    pub e: Option<String>,
+    #[serde(default)]
+    pub x: Option<String>,
+    #[serde(default)]
+    pub y: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OidcJwksKeySet {
+    pub keys: Vec<OidcJwkKey>,
+}
+
+/// Verifies incoming Google OAuth and Apple ID ("Sign in with Apple") OIDC JWT tokens
+/// and binds them deterministically to a stable `did:atlantis:` principal.
+///
+/// Key properties:
+/// - Principal DID is derived from `(expected_client_id, canonical_issuer, sub)` so different
+///   login tokens for the same Google or Apple account always resolve to the same Atlantis principal.
+/// - Session token incorporates per-login token entropy so each login gets a fresh session token.
+/// - Supports aligning both an Apple ID and a Google account to the same Atlantis principal,
+///   and linking a self-custody Solana wallet via a signed one-time challenge.
+/// - Production Google RS256 verification uses expiring, issuer-scoped HTTPS JWKS keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleJwksVerifier {
+    pub expected_client_id: String,
+    pub apple_service_id: Option<String>,
+    /// Maps secondary `"<provider>:<sub>"` keys to an existing primary `did:atlantis:` principal
+    /// when a consumer aligns their Apple ID and Google account.
+    #[serde(default)]
+    pub aligned_principals: HashMap<String, String>,
+    /// Maps primary `did:atlantis:` principals to their verified Solana wallet public key.
+    #[serde(default)]
+    pub linked_wallets: HashMap<String, String>,
+    /// Cached rotating JWKS keys indexed by `kid` from Google and Apple ID endpoints.
+    #[serde(default)]
+    pub cached_jwks: HashMap<String, OidcJwkKey>,
+    // Never deserialize provider trust or freshness from persisted/user-supplied state.
+    #[serde(skip)]
+    provider_keys: HashMap<String, (u64, HashMap<String, OidcJwkKey>)>,
+    /// Active nonces issued for `SolanaWalletLinkChallenge` to prevent replay.
+    #[serde(default)]
+    pub active_wallet_challenges: HashMap<String, SolanaWalletLinkChallenge>,
+    /// Set of consumed challenge nonces to permanently block replay attacks.
+    #[serde(default)]
+    pub consumed_wallet_nonces: std::collections::HashSet<String>,
+}
+
+impl GoogleJwksVerifier {
+    pub const GOOGLE_JWKS_URL: &'static str = "https://www.googleapis.com/oauth2/v3/certs";
+    pub const APPLE_JWKS_URL: &'static str = "https://appleid.apple.com/auth/keys";
+
+    pub fn new(expected_client_id: impl Into<String>) -> Self {
+        let client_id = std::env::var("GOOGLE_OAUTH_CLIENT_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| expected_client_id.into());
+        let apple_service_id = std::env::var("APPLE_SERVICE_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some("com.tr7n7t7.heavenlybound.web".to_string()));
+        Self {
+            expected_client_id: client_id,
+            apple_service_id,
+            aligned_principals: HashMap::new(),
+            linked_wallets: HashMap::new(),
+            cached_jwks: HashMap::new(),
+            provider_keys: HashMap::new(),
+            active_wallet_challenges: HashMap::new(),
+            consumed_wallet_nonces: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn with_apple_service_id(mut self, apple_service_id: impl Into<String>) -> Self {
+        self.apple_service_id = Some(apple_service_id.into());
+        self
+    }
+
+    /// Ingests a JSON Web Key Set (`{"keys": [...]}`) from Google or Apple ID into the verifier's key cache.
+    pub fn ingest_jwks_json(&mut self, jwks_json: &str) -> Result<usize, String> {
+        let keyset: OidcJwksKeySet = serde_json::from_str(jwks_json)
+            .map_err(|e| format!("Invalid JWKS JSON payload: {}", e))?;
+        let mut count = 0;
+        for key in keyset.keys {
+            if !key.kid.trim().is_empty() {
+                self.cached_jwks.insert(key.kid.clone(), key);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub async fn ensure_google_keys(&mut self) -> Result<(), String> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_secs();
+        if self.provider_keys.get("https://accounts.google.com").is_some_and(|(expiry, _)| now < *expiry) {
+            return Ok(());
+        }
+        self.refresh_google_keys().await.map(|_| ())
+    }
+
+    /// Refresh only from the fixed HTTPS provider endpoint; redirects are forbidden.
+    pub async fn refresh_google_keys(&mut self) -> Result<usize, String> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build().map_err(|e| e.to_string())?;
+        let response = client.get(Self::GOOGLE_JWKS_URL).send().await
+            .map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?;
+        let ttl = response.headers().get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').find_map(|part| part.trim().strip_prefix("max-age=")?.parse::<u64>().ok()))
+            .unwrap_or(300).min(86400);
+        let age = response.headers().get(reqwest::header::AGE)
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if body.len() + chunk.len() > 131072 { return Err("Provider JWKS too large".into()); }
+            body.extend_from_slice(&chunk);
+        }
+        let keyset: OidcJwksKeySet = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+        let mut keys = HashMap::new();
+        for key in keyset.keys {
+            if key.alg != "RS256" || key.kty != "RSA" || key.key_use.as_deref() != Some("sig") { continue; }
+            if key.kid.is_empty() || key.n.is_none() || key.e.is_none() || keys.contains_key(&key.kid) {
+                return Err("Malformed or duplicate provider JWK".into());
+            }
+            keys.insert(key.kid.clone(), key);
+        }
+        if keys.is_empty() { return Err("Provider returned no signing keys".into()); }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_secs();
+        let count = keys.len();
+        self.provider_keys.insert("https://accounts.google.com".into(), (now.saturating_add(ttl.saturating_sub(age)), keys));
+        Ok(count)
+    }
+
+    /// Issues and stores a fresh expiring `SolanaWalletLinkChallenge` for an authenticated principal.
+    pub fn issue_wallet_link_challenge(
+        &mut self,
+        principal_did: &str,
+        wallet_pubkey_hex: &str,
+        now_s: u64,
+        ttl_s: u64,
+    ) -> Result<SolanaWalletLinkChallenge, String> {
+        if !principal_did.starts_with("did:atlantis:") {
+            return Err("Principal DID must start with 'did:atlantis:'".to_string());
+        }
+        let target_did = format!("did:atlantis:{}", wallet_pubkey_hex);
+        PearlEnclaveIdentity::verifying_key_from_did(&target_did)
+            .map_err(|e| format!("Invalid Solana wallet public key hex: {}", e))?;
+
+        let nonce = format!("n_{}", Uuid::new_v4().simple());
+        let challenge = SolanaWalletLinkChallenge {
+            principal_did: principal_did.to_string(),
+            wallet_pubkey_hex: wallet_pubkey_hex.to_string(),
+            nonce: nonce.clone(),
+            issued_at_s: now_s,
+            expires_at_s: now_s.saturating_add(ttl_s.max(30)),
+        };
+        self.active_wallet_challenges.insert(nonce, challenge.clone());
+        Ok(challenge)
+    }
+
+    /// Deterministically verifies a Google or Apple ID OIDC JWT token and derives the user's
+    /// stable `did:atlantis:<hex>` principal and session token.
     pub fn verify_and_bind_jwt(
         &self,
         jwt_token: &str,
     ) -> Result<VerifiedAtlantisSession, String> {
+        self.verify_and_bind_jwt_at(jwt_token, None)
+    }
+
+    /// Verifies a signed token; an omitted clock override uses system time. RSA provider login requires fresh trusted provider keys; EC remains disabled.
+    pub fn verify_and_bind_jwt_at(
+        &self,
+        jwt_token: &str,
+        current_time_s: Option<u64>,
+    ) -> Result<VerifiedAtlantisSession, String> {
+        if jwt_token.len() > 16384 { return Err("OIDC token too large".into()); }
         let trimmed = jwt_token.trim();
         let parts: Vec<&str> = trimmed.split('.').collect();
         if parts.len() != 3 {
-            return Err("Invalid Google OAuth JWT format: must contain header, payload, and cryptographic signature parts".to_string());
+            return Err("Invalid OIDC JWT format: must contain header, payload, and cryptographic signature parts".to_string());
         }
 
         let header_b64 = parts[0];
@@ -399,29 +678,184 @@ impl GoogleJwksVerifier {
         let signature_b64 = parts[2];
 
         if header_b64.is_empty() || payload_b64.is_empty() || signature_b64.is_empty() {
-            return Err("Invalid Google OAuth JWT format: empty token segments".to_string());
+            return Err("Invalid OIDC JWT format: empty token segments".to_string());
         }
 
         // Validate minimum cryptographic signature entropy (at least 32 bytes encoded)
         if signature_b64.len() < 32 {
-            return Err("Invalid Google OAuth JWT: signature entropy insufficient".to_string());
+            return Err("Invalid OIDC JWT: signature entropy insufficient".to_string());
+        }
+        let sig_bytes = decode_base64url(signature_b64)?;
+        if sig_bytes.len() < 24 {
+            return Err("Invalid OIDC JWT: decoded signature too short".to_string());
         }
 
-        let mut hasher = Sha256::new();
-        hasher.update(self.expected_client_id.as_bytes());
-        hasher.update(b":");
-        hasher.update(trimmed.as_bytes());
-        let digest = hasher.finalize();
-        let hex_pubkey = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let header_bytes = decode_base64url(header_b64)?;
+        let header_json: serde_json::Value = serde_json::from_slice(&header_bytes)
+            .map_err(|_| "Invalid OIDC JWT header JSON".to_string())?;
+        let alg = header_json
+            .get("alg")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'alg' in OIDC JWT header".to_string())?;
+        if !matches!(alg, "RS256" | "ES256" | "EdDSA") {
+            return Err(format!("Unsupported or insecure JWT algorithm: '{}'", alg));
+        }
 
-        let did = format!("did:atlantis:{}", hex_pubkey);
-        let session_token = format!("atlantis_sess_{}", &hex_pubkey[..32]);
+        let payload_json: serde_json::Value = serde_json::from_slice(&decode_base64url(payload_b64)?)
+            .map_err(|_| "Invalid OIDC payload")?;
+        let issuer = payload_json.get("iss").and_then(|v| v.as_str()).ok_or("Missing issuer")?;
+        let provider = OidcProvider::from_issuer(issuer)?;
+        let now = current_time_s.unwrap_or(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map_err(|_| "Invalid clock")?.as_secs());
+        let kid = header_json.get("kid").and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty()).ok_or("Missing OIDC JWK kid")?;
+        if alg == "RS256" {
+            let (expires, keys) = self.provider_keys.get(provider.canonical_issuer())
+                .ok_or("Trusted provider keys unavailable")?;
+            if now >= *expires { return Err("Trusted provider keys expired".into()); }
+            let jwk = keys.get(kid).ok_or("Unknown provider key; refresh required")?;
+            if jwk.alg != "RS256" || jwk.kty != "RSA" { return Err("Invalid RSA key".into()); }
+            let n = decode_base64url(jwk.n.as_deref().ok_or("Missing RSA modulus")?)?;
+            let e = decode_base64url(jwk.e.as_deref().ok_or("Missing RSA exponent")?)?;
+            ring::signature::RsaPublicKeyComponents { n, e }
+                .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                    format!("{}.{}", header_b64, payload_b64).as_bytes(), &sig_bytes)
+                .map_err(|_| "RSA OIDC signature verification failed")?;
+        } else if alg == "EdDSA" {
+            // Local cryptographic fixtures only; provider login never trusts uploaded keys.
+            if !cfg!(test) { return Err("Provider requires RS256".into()); }
+            let jwk = self.cached_jwks.get(kid).ok_or("Unknown OIDC JWK kid")?;
+            if jwk.alg != alg || jwk.kty != "OKP" || jwk.key_use.as_deref() != Some("sig") {
+                return Err("OIDC JWK algorithm, type or use mismatch".to_string());
+            }
+            let pub_bytes = decode_base64url(jwk.x.as_deref().ok_or("Missing OIDC public key")?)?;
+            let pub_arr: [u8; 32] = pub_bytes.try_into().map_err(|_| "Invalid OIDC public key length")?;
+            let vk = ed25519_dalek::VerifyingKey::from_bytes(&pub_arr)
+                .map_err(|_| "Invalid OIDC public key")?;
+            let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into()
+                .map_err(|_| "Invalid OIDC signature length")?;
+            vk.verify_strict(format!("{}.{}", header_b64, payload_b64).as_bytes(),
+                &ed25519_dalek::Signature::from_bytes(&sig_arr))
+                .map_err(|_| "OIDC signature verification failed")?;
+
+        } else { return Err("Unsupported provider algorithm".into()); }
+
+        let sub = payload_json
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "Missing or empty 'sub' claim in OIDC JWT payload".to_string())?;
+
+        let expected_aud = match provider {
+            OidcProvider::Google => self.expected_client_id.as_str(),
+            OidcProvider::Apple => self.apple_service_id.as_deref()
+                .ok_or("Apple sign-in is not configured")?,
+        };
+        if expected_aud.is_empty() || payload_json.get("aud").and_then(|v| v.as_str()) != Some(expected_aud) {
+            return Err("Missing or mismatched OIDC audience".to_string());
+        }
+        let exp = payload_json.get("exp").and_then(|v| v.as_u64())
+            .ok_or("Missing or invalid OIDC expiry")?;
+        if now >= exp {
+            return Err("OIDC JWT token has expired".to_string());
+        }
+        if let Some(nbf) = payload_json.get("nbf") {
+            if nbf.as_u64().ok_or("Invalid OIDC not-before")? > now {
+                return Err("OIDC JWT is not yet valid".to_string());
+            }
+        }
+
+        let canonical_iss = provider.canonical_issuer();
+        let align_key = format!("{}:{}", canonical_iss, sub);
+
+        // Check if this (provider, sub) has been aligned to an existing primary Atlantis DID
+        let did = if let Some(aligned_did) = self.aligned_principals.get(&align_key) {
+            aligned_did.clone()
+        } else {
+            let mut id_hasher = Sha256::new();
+            id_hasher.update(b"ATLANTIS_OIDC_PRINCIPAL_V2:");
+            id_hasher.update(self.expected_client_id.as_bytes());
+            id_hasher.update(b":");
+            id_hasher.update(canonical_iss.as_bytes());
+            id_hasher.update(b":");
+            id_hasher.update(sub.as_bytes());
+            let id_digest = id_hasher.finalize();
+            let hex_pubkey = atlantis_protocol::bytes_to_hex(&id_digest);
+            format!("did:atlantis:{}", hex_pubkey)
+        };
+
+        // Session token binds principal DID + signature entropy so rotating tokens produce distinct sessions
+        let mut sess_hasher = Sha256::new();
+        sess_hasher.update(b"ATLANTIS_OIDC_SESSION_V2:");
+        sess_hasher.update(did.as_bytes());
+        sess_hasher.update(b":");
+        sess_hasher.update(signature_b64.as_bytes());
+        let sess_hex = atlantis_protocol::bytes_to_hex(&sess_hasher.finalize());
+        let session_token = format!("atlantis_sess_{}", &sess_hex[..32]);
+
+        let linked_solana_wallet = self.linked_wallets.get(&did).cloned();
 
         Ok(VerifiedAtlantisSession {
-            google_sub: payload_b64.to_string(),
+            provider,
+            issuer: canonical_iss.to_string(),
+            subject: sub.to_string(),
+            google_sub: sub.to_string(),
             did,
             session_token,
+            expires_at_s: exp,
+            linked_solana_wallet,
         })
+    }
+
+    /// Aligns a consumer's secondary OIDC identity (e.g., Apple ID) to their existing primary
+    /// Atlantis session (e.g., Google account) or vice versa, so both sign-in methods resolve
+    /// to the exact same `did:atlantis:` principal and wallet profile.
+    pub fn align_consumer_accounts(
+        &mut self,
+        primary_jwt: &str,
+        secondary_jwt: &str,
+        current_time_s: Option<u64>,
+    ) -> Result<VerifiedAtlantisSession, String> {
+        let primary_session = self.verify_and_bind_jwt_at(primary_jwt, current_time_s)?;
+        let secondary_session = self.verify_and_bind_jwt_at(secondary_jwt, current_time_s)?;
+
+        let sec_key = format!("{}:{}", secondary_session.issuer, secondary_session.subject);
+        let pri_key = format!("{}:{}", primary_session.issuer, primary_session.subject);
+        self.aligned_principals.insert(sec_key, primary_session.did.clone());
+        self.aligned_principals.insert(pri_key, primary_session.did.clone());
+
+        self.verify_and_bind_jwt_at(secondary_jwt, current_time_s)
+    }
+
+    /// Links a verified self-custody Solana wallet to an authenticated Atlantis principal
+    /// after verifying the signed one-time challenge.
+    pub fn link_solana_wallet(
+        &mut self,
+        challenge: &SolanaWalletLinkChallenge,
+        signature_hex: &str,
+        current_time_s: u64,
+    ) -> Result<String, String> {
+        challenge.verify_wallet_signature(signature_hex, current_time_s)?;
+        if self.consumed_wallet_nonces.contains(&challenge.nonce) {
+            return Err("Wallet link challenge nonce has already been consumed".to_string());
+        }
+        match self.active_wallet_challenges.get(&challenge.nonce) {
+            Some(stored) if stored == challenge => {}
+            _ => return Err("Wallet link challenge nonce not found or mismatched".to_string()),
+        }
+        // Prevent cross-account wallet hijacking unless re-linking the same principal
+        for (existing_did, existing_wallet) in &self.linked_wallets {
+            if existing_wallet == &challenge.wallet_pubkey_hex && existing_did != &challenge.principal_did {
+                return Err("Solana wallet is already bound to a different Atlantis principal".to_string());
+            }
+        }
+        self.active_wallet_challenges.remove(&challenge.nonce);
+        self.consumed_wallet_nonces.insert(challenge.nonce.clone());
+        self.linked_wallets.insert(
+            challenge.principal_did.clone(),
+            challenge.wallet_pubkey_hex.clone(),
+        );
+        Ok(challenge.wallet_pubkey_hex.clone())
     }
 }
 
@@ -493,7 +927,7 @@ impl ClubHomeNode {
     /// locks the budget in Coral Escrow, and returns the broadcastable Kuroshio Gyre envelope.
     pub fn dispatch_marketplace_job(
         &mut self,
-        buyer_did: String,
+        _buyer_did: String,
         buyer_account: Uuid,
         category: JobCategory,
         budget_amount: f64,
@@ -711,19 +1145,105 @@ mod tests {
     }
 
     #[test]
-    fn test_google_jwks_deterministic_did_binding() {
-        let verifier = GoogleJwksVerifier::new("atlantis-prod-client-id");
-        let mock_jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFsaWNlIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
-        let s1 = verifier
-            .verify_and_bind_jwt(mock_jwt)
-            .expect("valid jwt");
-        let s2 = verifier
-            .verify_and_bind_jwt(mock_jwt)
-            .expect("valid jwt");
+    fn oidc_requires_signature_and_required_claims() {
+        fn b64(bytes: &[u8]) -> String {
+            const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            let mut bits = 0u32;
+            let mut count = 0;
+            for &byte in bytes {
+                bits = (bits << 8) | byte as u32;
+                count += 8;
+                while count >= 6 {
+                    count -= 6;
+                    out.push(ABC[((bits >> count) & 63) as usize] as char);
+                }
+            }
+            if count > 0 { out.push(ABC[((bits << (6-count)) & 63) as usize] as char); }
+            out
+        }
+        use ed25519_dalek::Signer;
+        let key = PearlEnclaveIdentity::from_label("oidc-signature-test");
+        let mut verifier = GoogleJwksVerifier::new("client");
+        verifier.expected_client_id = "client".into();
+        verifier.ingest_jwks_json(&serde_json::json!({"keys":[{
+            "kid":"test", "alg":"EdDSA", "kty":"OKP", "use":"sig",
+            "x":b64(&key.signing_key().verifying_key().to_bytes())
+        }]}).to_string()).unwrap();
+        let token = |claims: serde_json::Value| {
+            let input = format!("{}.{}", b64(br#"{"alg":"EdDSA","kid":"test"}"#), b64(claims.to_string().as_bytes()));
+            format!("{}.{}", input, b64(&key.signing_key().sign(input.as_bytes()).to_bytes()))
+        };
+        let claims = serde_json::json!({"iss":"https://accounts.google.com","sub":"account","aud":"client","exp":200});
+        let valid = token(claims.clone());
+        assert!(verifier.verify_and_bind_jwt_at(&valid, Some(100)).is_ok());
+        assert!(verifier.verify_and_bind_jwt_at(&valid, Some(200)).is_err());
+        assert!(verifier.verify_and_bind_jwt(&valid).is_err());
+        for field in ["iss", "aud", "exp", "sub"] {
+            let mut invalid = claims.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(verifier.verify_and_bind_jwt_at(&token(invalid), Some(100)).is_err());
+        }
+        let mut tampered = valid.into_bytes();
+        let last = tampered.len()-3;
+        tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+        assert!(verifier.verify_and_bind_jwt_at(std::str::from_utf8(&tampered).unwrap(), Some(100)).is_err());
+        verifier.cached_jwks.clear();
+        assert!(verifier.verify_and_bind_jwt_at(&token(claims), Some(100)).is_err());
+    }
 
-        assert_eq!(s1, s2);
-        assert!(s1.did.starts_with("did:atlantis:"));
-        assert_eq!(s1.did.len(), "did:atlantis:".len() + 64);
+    #[tokio::test]
+    #[ignore = "requires live Google HTTPS access"]
+    async fn google_jwks_live_refresh() {
+        let mut verifier = GoogleJwksVerifier::new("client");
+        assert!(verifier.refresh_google_keys().await.unwrap() > 0);
+        assert!(verifier.provider_keys.contains_key("https://accounts.google.com"));
+        verifier.ensure_google_keys().await.unwrap();
+    }
+
+    #[test]
+    fn rsa_provider_signature_trust_and_expiry() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("oidc_rsa_test.json")).unwrap();
+        let token = fixture["token"].as_str().unwrap();
+        let jwk: OidcJwkKey = serde_json::from_value(fixture["jwk"].clone()).unwrap();
+        let mut verifier = GoogleJwksVerifier::new("client");
+        verifier.expected_client_id = "client".into();
+        assert!(verifier.verify_and_bind_jwt_at(token, Some(100)).is_err());
+        // Uploaded generic keys cannot establish provider trust.
+        verifier.cached_jwks.insert(jwk.kid.clone(), jwk.clone());
+        assert!(verifier.verify_and_bind_jwt_at(token, Some(100)).is_err());
+        let mut keys = HashMap::new();
+        keys.insert(jwk.kid.clone(), jwk.clone());
+        verifier.provider_keys.insert("https://accounts.google.com".into(), (150, keys.clone()));
+        assert!(verifier.verify_and_bind_jwt_at(token, Some(100)).is_ok());
+        assert!(verifier.verify_and_bind_jwt_at(token, Some(150)).is_err());
+        let mut tampered = token.as_bytes().to_vec();
+        let index = tampered.len()-3;
+        tampered[index] = if tampered[index] == b'A' { b'B' } else { b'A' };
+        assert!(verifier.verify_and_bind_jwt_at(std::str::from_utf8(&tampered).unwrap(), Some(100)).is_err());
+        verifier.provider_keys.clear();
+        verifier.provider_keys.insert("https://appleid.apple.com".into(), (150, keys));
+        assert!(verifier.verify_and_bind_jwt_at(token, Some(100)).is_err());
+        let serialized = serde_json::to_string(&verifier).unwrap();
+        let restored: GoogleJwksVerifier = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.provider_keys.is_empty());
+    }
+
+    #[test]
+    fn oidc_and_wallet_fail_closed() {
+        let mut verifier = GoogleJwksVerifier::new("client");
+        let forged = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        assert!(verifier.verify_and_bind_jwt(forged).is_err());
+        let wallet = PearlEnclaveIdentity::from_label("wallet-security-test");
+        let address = wallet.did().strip_prefix("did:atlantis:").unwrap().to_string();
+        let challenge = verifier.issue_wallet_link_challenge("did:atlantis:account", &address, 100, 300).unwrap();
+        use ed25519_dalek::Signer;
+        let signature = wallet.signing_key().sign(challenge.signing_message().as_bytes());
+        let signature = atlantis_protocol::bytes_to_hex(&signature.to_bytes());
+        let mut empty = GoogleJwksVerifier::new("client");
+        assert!(empty.link_solana_wallet(&challenge, &signature, 101).is_err());
+        assert!(verifier.link_solana_wallet(&challenge, &signature, 101).is_ok());
+        assert!(verifier.link_solana_wallet(&challenge, &signature, 102).is_err());
     }
 
     #[test]

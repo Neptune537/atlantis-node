@@ -357,3 +357,119 @@ pub fn wgs84_to_ecef(lat_deg: f64, lon_deg: f64, alt_m: f64) -> [f64; 3] {
 
     [x, y, z]
 }
+
+// ============================================================================
+// STUDIO DUAL-NODE ARCHITECTURE: LUMERIA (VISUAL/GAME) <-> ATLANTIS (SOUND/PROCESSES)
+// ============================================================================
+
+/// Defines the two sovereign Studio Node aspects:
+/// - **LumeriaVisualGameNode**: Dedicated to 3D visuals, WebGPU/Vulkan rendering, 3D Gaussian Splats,
+///   combined-arms gameplay physics, and Quest 3 / Android XR spatial interaction.
+/// - **AtlantisSoundProcessNode**: Dedicated to 24/7 Siren Frequency sound, Sabine RT60 acoustics,
+///   OpenRaft consensus, Tide double-entry ledger, Coral Escrow, DTN spooling, and AI Gate processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StudioNodeAspect {
+    /// Lumeria Studio Node: Visuals, 3D Gaussian Splats, PBR shaders, 60Hz/90Hz/120Hz game simulation & XR.
+    LumeriaVisualGameNode,
+    /// Atlantis Studio Node: Sound (Siren Radio, Sabine RT60), OpenRaft consensus, Tide Ledger, Coral Escrow & AI Gate processes.
+    AtlantisSoundProcessNode,
+}
+
+impl StudioNodeAspect {
+    pub fn canonical_label(&self) -> &'static str {
+        match self {
+            Self::LumeriaVisualGameNode => "Lumeria Studio Node (Visual & Game Aspect)",
+            Self::AtlantisSoundProcessNode => "Atlantis Studio Node (Sound & Processes Aspect)",
+        }
+    }
+}
+
+/// Descriptor for an active Studio Node participating in the paired Lumeria <-> Atlantis Studio architecture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StudioNodeDescriptor {
+    pub node_id: String,
+    pub did: String,
+    pub aspect: StudioNodeAspect,
+    pub platform_target: String,
+    pub primary_endpoint: String,
+    pub secondary_endpoint: Option<String>,
+    pub responsibilities: Vec<String>,
+}
+
+/// Complete Studio Pair Topology linking the Android / XR **Lumeria Visual & Game Node**
+/// and the Raspberry Pi **Atlantis Sound & Processes Node** into a unified Studio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StudioPairTopology {
+    pub studio_id: String,
+    pub lumeria_visual_game_node: StudioNodeDescriptor,
+    pub atlantis_sound_process_node: StudioNodeDescriptor,
+    pub sync_rail_ws_url: String,
+    pub ledger_rest_api_url: String,
+    pub siren_audio_stream_url: String,
+}
+
+impl StudioPairTopology {
+    /// Constructs the canonical Studio Pair connecting an Android / Quest 3 Lumeria Visual & Game Node
+    /// with the Raspberry Pi (`pi_host`, e.g. `"10.0.0.60"`) Atlantis Sound & Processes Node.
+    pub fn new_android_and_pi_pair(
+        studio_id: impl Into<String>,
+        lumeria_node_id: impl Into<String>,
+        lumeria_did: impl Into<String>,
+        atlantis_node_id: impl Into<String>,
+        atlantis_did: impl Into<String>,
+        pi_lan_host: &str,
+    ) -> Self {
+        let host = pi_lan_host.trim().trim_end_matches('/');
+        let l_id = lumeria_node_id.into();
+        let a_id = atlantis_node_id.into();
+
+        let lumeria_visual_game_node = StudioNodeDescriptor {
+            node_id: l_id,
+            did: lumeria_did.into(),
+            aspect: StudioNodeAspect::LumeriaVisualGameNode,
+            platform_target: "Android Native APK (Vulkan 1.3 / wgpu / OpenXR) & Chrome WebXR".to_string(),
+            primary_endpoint: format!("ws://{}:9001/ws", host),
+            secondary_endpoint: Some(format!("http://{}:8081", host)),
+            responsibilities: vec![
+                "Clustered Forward+ (3,456 cells) & Cook-Torrance GGX PBR Visual Rendering".to_string(),
+                "3D Gaussian Splatting (4-pass LSD Radix Sort) & Procedural Craft Rendering".to_string(),
+                "60Hz/90Hz/120Hz Deterministic Game Physics (Pacejka & Combined-Arms)".to_string(),
+                "Nautilus 64-bit ECEF Geodesic World & Camera-Relative 32-bit Origin Shifting".to_string(),
+                "Quest 3 / Android 6DOF Spatial Raycast Pointing & Diegetic Studio HUD".to_string(),
+            ],
+        };
+
+        let atlantis_sound_process_node = StudioNodeDescriptor {
+            node_id: a_id,
+            did: atlantis_did.into(),
+            aspect: StudioNodeAspect::AtlantisSoundProcessNode,
+            platform_target: "Raspberry Pi Local Server (Atlantis Home Node + Sebastian Supervisor)".to_string(),
+            primary_endpoint: format!("ws://{}:9001/ws", host),
+            secondary_endpoint: Some(format!("http://{}:8081", host)),
+            responsibilities: vec![
+                "24/7 Seven Daughters Siren Frequency Audio Stream & Sabine RT60 Acoustic Engine".to_string(),
+                "OpenRaft Consensus State Machine & Execution Rail WebSocket (Port 9001)".to_string(),
+                "Tide Double-Entry Ledger, Coral Escrow Vaults & Marketplace API (Port 8081)".to_string(),
+                "RFC 5050 DTN Store-and-Forward Bundle Spooling & SQLite Persistence".to_string(),
+                "Local AI Gate (mDNS ZeroConf) & Sebastian 1Hz Hardware PoH Canary Supervision".to_string(),
+            ],
+        };
+
+        Self {
+            studio_id: studio_id.into(),
+            lumeria_visual_game_node,
+            atlantis_sound_process_node,
+            sync_rail_ws_url: format!("ws://{}:9001/ws", host),
+            ledger_rest_api_url: format!("http://{}:8081", host),
+            siren_audio_stream_url: format!("http://{}:8080/live.mp3", host),
+        }
+    }
+
+    /// Validates that the two nodes in the Studio Pair have complementary aspects (`LumeriaVisualGameNode` and `AtlantisSoundProcessNode`).
+    pub fn verify_studio_separation(&self) -> bool {
+        self.lumeria_visual_game_node.aspect == StudioNodeAspect::LumeriaVisualGameNode
+            && self.atlantis_sound_process_node.aspect == StudioNodeAspect::AtlantisSoundProcessNode
+            && self.lumeria_visual_game_node.did.starts_with("did:atlantis:")
+            && self.atlantis_sound_process_node.did.starts_with("did:atlantis:")
+    }
+}

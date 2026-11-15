@@ -1,0 +1,29 @@
+{
+  "verified_at_utc": "2026-11-12T00:14:29.526158+00:00",
+  "host": "zero@10.0.0.60",
+  "container": "atlantis-auth-api",
+  "bind": "127.0.0.1:8087",
+  "source_archive_sha256": "a09b055a82b05fb08eeec49ab6fbfe6d39310af174d80e7f4a4335001d015432",
+  "api_origin": "https://tr7n7t7.com",
+  "google_client_id": "615673989451-f294t6230ml283pmcrd4uqcgmbd8m9jp.apps.googleusercontent.com",
+  "api_checks": {
+    "unauthenticated_me": 401,
+    "invalid_token": 401,
+    "allowed_preflight": 200,
+    "untrusted_origin": 403,
+    "key_upload": 403
+  },
+  "portal_popup_fix": "Firebase signInWithPopup removed; shared Google FedCM button",
+  "radio_check": 200,
+  "sonar_upgrade": 403,
+  "real_google_login_tested": false,
+  "runtime_build": "ARM64 debug binary in cached Rust image; optimize release image before production",
+  "dashboard_deployment": "https://cd104d7f.heavenlybound-lite.pages.dev",
+  "portal_signin_route": "https://heavenlybound-lite.pages.dev/?signin=google",
+  "legacy_game_route": "https://heavenlysent-680ac.web.app/?venue=atlantis",
+  "terrain_preparation": "Incremental 4ms CPU work slices, exact geometry parity tested",
+  "desktop_pacing_latest_ms": {
+    "median": 16.7,
+    "p95": 16.9
+  }
+}

@@ -1,5 +1,20 @@
 # AGENTS.md
 
+Local auth source update 2026-11-14: `/api/auth/node-browser/capability` verifies
+the caller's bearer session and optional `ATLANTIS_NODE_BROWSER_OWNER_DID` owner
+binding, but always reports the remote browser unavailable. It does not issue
+browser sessions, start a worker, or stream a desktop. Keep those operations
+disabled until owner authorization, worker isolation and private transport are
+implemented and tested. The route is not deployed.
+
+## Current integration and funding record
+
+Reviewed 2026-11-11. Read [platform runtime status](../../PLATFORM_RUNTIME_STATUS.md) and the [CYAN economy proposal](CYAN_ECONOMY_PROPOSAL.md) before changing identity, wallet, membership or settlement behavior. The feature catalog below is a platform roadmap.
+
+The agreed membership is $12 per user annually after official launch, including store owners. Stores also contribute 10% of eligible income. Preview activity is free. Keep launch gating, membership dues and store settlement distinct in implementation and reporting.
+
+Treat Google/Apple identity alignment and wallet-link code as requiring security integration review. Google RS256 now requires signatures verified with fresh issuer-scoped keys fetched from the fixed provider HTTPS endpoint. Client-uploaded keys and production EdDSA/EC provider tokens are rejected. Opaque bearer sessions now persist as hashes in SQLite, with expiry and logout revocation. Wallet APIs require a bearer-session principal matching the target and an exact registered one-time challenge. The HTTP wallet/account/challenge paths now persist transactionally in SQLite; older verifier helpers remain memory-backed. Both web shells use a shared bearer-session client. Apple key loading, native identity bridging and real browser/device login acceptance remain unfinished. Account alignment is disabled until durable migration support exists. Require verification against trusted provider keys and authorized, durable account state before exposing financial or private-data operations. Record deployed mint and contract evidence separately from Rust reference models.
+
 Instructions, platform architecture, and roadmap of features for the **Atlantis Platform** (Social Clubs & Entrepreneur Network).
 
 ---
@@ -106,3 +121,5 @@ When building, generating code, or scaffolding features for Atlantis, follow the
 
 3. **Modularity First:**
    - Design club features as pluggable components. A book club should only load reading tracker modules without loading nightlife crowd radar modules unless configured by the community admin.
+
+Auth deployment reviewed 2026-11-11 Chicago: seed Pi zero@10.0.0.60 runs a separate auth-only container on loopback 8087, routed through the apex /api/auth paths. Google client ID and API origin are configured in the shared web clients. The portal Firebase popup was replaced with the Google FedCM button; preserve the game isolation headers. Public negative-auth/CORS checks passed; real Google account/device acceptance remains open, and Sonar still returned 403. See the platform runtime status and Atlantis/deploy/auth_seed_release_20261111.json for the dated record.

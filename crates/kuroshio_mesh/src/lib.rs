@@ -5,6 +5,9 @@
 
 pub mod htlc_geofence;
 pub mod transport;
+pub mod oracle_verification;
+pub mod temporal_anchor;
+pub mod temporal_trust;
 
 pub use htlc_geofence::{
     GeofencePublicInputs, Groth16Proof, HtlcGeofenceEngine, HtlcSettlementError, HtlcZkEscrow,

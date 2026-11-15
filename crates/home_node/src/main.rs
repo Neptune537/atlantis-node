@@ -5,7 +5,7 @@ use axum::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
-    http::StatusCode,
+    http::{StatusCode, HeaderMap},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -121,9 +121,39 @@ pub struct MergeStoreAppResponse {
     pub merged_files: std::collections::BTreeMap<String, Option<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcLoginRequest {
+    pub id_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlignAccountsRequest {
+    pub primary_id_token: String,
+    pub secondary_id_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueWalletChallengeRequest {
+    pub principal_did: String,
+    pub wallet_pubkey_hex: String,
+    pub ttl_s: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkSolanaWalletRequest {
+    pub challenge: home_node::SolanaWalletLinkChallenge,
+    pub signature_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncJwksRequest {
+    pub jwks_json: String,
+}
+
 pub struct AppState {
     pub home_node: RwLock<ClubHomeNode>,
     pub service_gate: RwLock<home_node::ServiceApprovalGate>,
+    pub sessions: std::sync::Mutex<home_node::sessions::SessionStore>,
     pub telemetry_tx: broadcast::Sender<RailWebSocketMessage>,
     pub sysinfo_state: std::sync::Mutex<sysinfo::System>,
     pub components_state: std::sync::Mutex<sysinfo::Components>,
@@ -310,6 +340,114 @@ async fn post_3way_app_merge(
         conflicts: outcome.conflicts,
         merged_files: merged_utf8,
     }))
+}
+
+fn bearer(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
+    headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((StatusCode::UNAUTHORIZED, "Bearer session required".into()))
+}
+fn authenticate_session(state: &AppState, headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Clock unavailable".into()))?.as_secs();
+    state.sessions.lock().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable".into()))?
+        .authenticate(bearer(headers)?, now)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid or expired session".into()))
+}
+#[derive(Deserialize)]
+struct LogoutRequest { #[serde(default)] all_sessions: bool }
+async fn post_auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<LogoutRequest>)
+    -> Result<StatusCode, (StatusCode, String)> {
+    let principal = authenticate_session(&state, &headers)?;
+    let mut store = state.sessions.lock().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable".into()))?;
+    if req.all_sessions { store.revoke_all(&principal) } else { store.revoke(bearer(&headers)?) }
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Session revocation failed".into()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_auth_me(State(state): State<Arc<AppState>>, headers: HeaderMap)
+    -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let principal = authenticate_session(&state, &headers)?;
+    let wallet = state.sessions.lock().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Identity store unavailable".into()))?
+        .wallet(&principal).map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Wallet lookup failed".into()))?;
+    Ok(Json(serde_json::json!({"principal_did":principal,"linked_solana_wallet":wallet})))
+}
+
+async fn post_auth_oidc_login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OidcLoginRequest>,
+) -> Result<Json<home_node::VerifiedAtlantisSession>, (StatusCode, String)> {
+    let mut node = state.home_node.write().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
+    node.jwks_verifier.ensure_google_keys().await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Identity provider keys unavailable".into()))?;
+    let mut session = node.jwks_verifier.verify_and_bind_jwt_at(&req.id_token, now)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+    let now = now.ok_or((StatusCode::SERVICE_UNAVAILABLE, "Clock unavailable".into()))?;
+    let (token, expires) = state.sessions.lock().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable".into()))?
+        .issue(&session.did, now, session.expires_at_s)
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Session persistence failed".into()))?;
+    session.linked_solana_wallet = state.sessions.lock().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Identity store unavailable".into()))?
+        .wallet(&session.did).map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Wallet lookup failed".into()))?;
+    session.session_token = token;
+    session.expires_at_s = expires;
+    Ok(Json(session))
+}
+
+async fn post_auth_align_accounts(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AlignAccountsRequest>,
+) -> Result<Json<home_node::VerifiedAtlantisSession>, (StatusCode, String)> {
+    let _ = (state, req);
+    Err((StatusCode::FORBIDDEN, "Account alignment requires durable migration support".into()))
+}
+
+async fn post_auth_issue_challenge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<IssueWalletChallengeRequest>,
+) -> Result<Json<home_node::SolanaWalletLinkChallenge>, (StatusCode, String)> {
+    let principal = authenticate_session(&state, &headers)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if principal != req.principal_did {
+        return Err((StatusCode::FORBIDDEN, "Account does not own wallet challenge".into()));
+    }
+    state.sessions.lock().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Identity store unavailable".into()))?
+        .issue_wallet_challenge(&principal, &req.wallet_pubkey_hex, now, req.ttl_s.unwrap_or(300))
+        .map(Json).map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+async fn post_auth_sync_jwks(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SyncJwksRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _ = (state, req);
+    Err((StatusCode::FORBIDDEN, "Client-supplied signing keys are forbidden".into()))
+}
+
+async fn post_auth_link_wallet(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<LinkSolanaWalletRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let principal = authenticate_session(&state, &headers)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if principal != req.challenge.principal_did {
+        return Err((StatusCode::FORBIDDEN, "Account does not own wallet challenge".into()));
+    }
+    state.sessions.lock().map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Identity store unavailable".into()))?
+        .link_wallet(&principal, &req.challenge, &req.signature_hex, now)
+        .map(|wallet| Json(serde_json::json!({"status":"LINKED", "principal_did":principal,"linked_solana_wallet":wallet})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
 async fn get_club_officers(
@@ -620,6 +758,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_components = sysinfo::Components::new_with_refreshed_list();
 
     let state = Arc::new(AppState {
+        sessions: std::sync::Mutex::new({
+            let path = std::env::var_os("ATLANTIS_SESSION_DB")
+                .map(std::path::PathBuf::from).unwrap_or_else(|| "data/auth-sessions.sqlite".into());
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).expect("create private session data directory");
+            }
+            home_node::sessions::SessionStore::open(path).expect("open durable session store")
+        }),
         home_node: RwLock::new(home_node),
         service_gate: RwLock::new(home_node::ServiceApprovalGate::new()),
         telemetry_tx: telemetry_tx.clone(),
@@ -731,6 +877,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/service/verify", axum::routing::post(post_verify_daemon_launch))
         // 3-way baseline app store merge
         .route("/api/store/app/merge", axum::routing::post(post_3way_app_merge))
+        // Consumer OIDC (Google & Apple ID) sign-in, account alignment, and Solana wallet linking
+        .merge(Router::new()
+        .route("/api/auth/me", get(get_auth_me))
+        .route("/api/auth/logout", axum::routing::post(post_auth_logout))
+        .route("/api/auth/oidc", axum::routing::post(post_auth_oidc_login))
+        .route("/api/auth/align", axum::routing::post(post_auth_align_accounts))
+        .route("/api/auth/wallet-challenge", axum::routing::post(post_auth_issue_challenge))
+        .route("/api/auth/link-wallet", axum::routing::post(post_auth_link_wallet))
+        .route("/api/auth/jwks-sync", axum::routing::post(post_auth_sync_jwks))
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
+        .layer(axum::middleware::map_response(|mut response: axum::response::Response| async move {
+            response.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+            response
+        }))
         .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
@@ -813,4 +973,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Atlantis Home Node shut down cleanly.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_route_tests {
+    use super::*;
+    fn headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
+        headers
+    }
+    #[tokio::test]
+    async fn wallet_routes_enforce_two_account_ownership_and_logout() {
+        let (telemetry_tx, _) = broadcast::channel(1);
+        let state = Arc::new(AppState {
+            home_node: RwLock::new(ClubHomeNode::new("auth-route-test", 0.0)),
+            service_gate: RwLock::new(home_node::ServiceApprovalGate::new()),
+            sessions: std::sync::Mutex::new(home_node::sessions::SessionStore::open(":memory:").unwrap()),
+            telemetry_tx,
+            sysinfo_state: std::sync::Mutex::new(sysinfo::System::new()),
+            components_state: std::sync::Mutex::new(sysinfo::Components::new()),
+        });
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let alice = state.sessions.lock().unwrap().issue("did:atlantis:alice", now, now+3600).unwrap().0;
+        let bob = state.sessions.lock().unwrap().issue("did:atlantis:bob", now, now+3600).unwrap().0;
+        let wallet = atlantis_protocol::PearlEnclaveIdentity::from_label("route-wallet");
+        let address = wallet.did().strip_prefix("did:atlantis:").unwrap().to_string();
+        let request = || IssueWalletChallengeRequest { principal_did:"did:atlantis:alice".into(), wallet_pubkey_hex:address.clone(), ttl_s:None };
+        assert_eq!(post_auth_issue_challenge(State(state.clone()), HeaderMap::new(), Json(request())).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(post_auth_issue_challenge(State(state.clone()), headers(&bob), Json(request())).await.unwrap_err().0, StatusCode::FORBIDDEN);
+        let challenge = post_auth_issue_challenge(State(state.clone()), headers(&alice), Json(request())).await.unwrap().0;
+        use ed25519_dalek::Signer;
+        let signature = atlantis_protocol::bytes_to_hex(&wallet.signing_key().sign(challenge.signing_message().as_bytes()).to_bytes());
+        let link = || LinkSolanaWalletRequest { challenge:challenge.clone(), signature_hex:signature.clone() };
+        assert_eq!(post_auth_link_wallet(State(state.clone()), headers(&bob), Json(link())).await.unwrap_err().0, StatusCode::FORBIDDEN);
+        assert!(post_auth_link_wallet(State(state.clone()), headers(&alice), Json(link())).await.is_ok());
+        assert!(post_auth_link_wallet(State(state.clone()), headers(&alice), Json(link())).await.is_err());
+        assert_eq!(post_auth_logout(State(state.clone()), headers(&alice), Json(LogoutRequest { all_sessions:true })).await.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(post_auth_issue_challenge(State(state.clone()), headers(&alice), Json(request())).await.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(authenticate_session(&state, &headers(&bob)).unwrap(), "did:atlantis:bob");
+    }
 }

@@ -42,6 +42,12 @@ pub enum SolanaProgramError {
     ProposalNotActive(String),
     #[error("Proposal `{0}` has not succeeded and cannot be executed")]
     ProposalNotSucceeded(String),
+    #[error("Proposal `{proposal_id}` voting window has not closed yet (now {now}, ends at {voting_ends_at})")]
+    VotingStillOpen {
+        proposal_id: String,
+        now: u64,
+        voting_ends_at: u64,
+    },
     #[error("Voter `{0}` has already cast a vote on proposal `{1}`")]
     DuplicateVote(String, String),
     #[error("Treasury transaction `{0}` not found")]
@@ -372,7 +378,10 @@ impl DaoGovernanceEngine {
             return Err(SolanaProgramError::ProposalNotActive(proposal_id.to_string()));
         }
 
-        if !voter_stake_account.qualifies_for_subscription() {
+        if !voter_stake_account.qualifies_for_subscription()
+            && platform_power == 0
+            && community_power == 0
+        {
             return Err(SolanaProgramError::InsufficientQualifyingStake(
                 voter_stake_account.staked_usd_value,
             ));
@@ -388,10 +397,16 @@ impl DaoGovernanceEngine {
             ));
         }
 
-        let quadratic_stake_weight = voter_stake_account.quadratic_voting_power();
-        proposal
-            .staking_tally
-            .record(choice, quadratic_stake_weight);
+        let quadratic_stake_weight = if voter_stake_account.qualifies_for_subscription() {
+            voter_stake_account.quadratic_voting_power()
+        } else {
+            0
+        };
+        if quadratic_stake_weight > 0 {
+            proposal
+                .staking_tally
+                .record(choice, quadratic_stake_weight);
+        }
         proposal.platform_tally.record(choice, platform_power);
         proposal.community_tally.record(choice, community_power);
         proposal
@@ -432,6 +447,14 @@ impl DaoGovernanceEngine {
 
         if proposal.state != ProposalState::Active {
             return Ok(proposal.state);
+        }
+
+        if current_timestamp < proposal.voting_ends_at {
+            return Err(SolanaProgramError::VotingStillOpen {
+                proposal_id: proposal_id.to_string(),
+                now: current_timestamp,
+                voting_ends_at: proposal.voting_ends_at,
+            });
         }
 
         if current_timestamp > proposal.voting_ends_at.saturating_add(expiration_grace_period) {
