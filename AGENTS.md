@@ -216,3 +216,13 @@ When creating or modifying code anywhere in this repository:
       - **Co-Spawning:** `Lite` (tactical HUD) and `Nautilus` (planetary open-world engine) must be co-spawnable within each other's execution contexts without tearing down graphics state.
       - **Background Idle Rotation:** While in `IdleMenu` mode, the Nautilus 3D Earth Globe must remain continuously visible, idling in a slow planetary spin (default `0.05 rad/s`).
       - **Break-Apart Transition:** Entering gameplay must trigger a horizontal split animation, driving HUD wings off-screen (`-960px` / `+960px` scaled to screen width) and scaling opacity to reveal the globe and active simulation. Exiting returns the panels smoothly.
+
+11. **Federal Contracting, Defense & Civil Sector Invariants:**
+    - **Targeted Vehicles:**
+      - SBIR/STTR Phase I/II via DARPA, DIU, Army Futures Command (JADC2 in DDIL contested environments).
+      - DHS S&T and FEMA for instant ad-hoc disaster mesh command nodes and decentralized zero-trust identity (`did:atlantis:`).
+      - DOT/FHWA for connected vehicle V2X roadside compute nodes and road spline geodesics.
+    - **Key Technical Standards for Federal Compliance:**
+      - FIPS 140-3 cryptography compliance for local ledger and state channel signatures.
+      - NIST SP 800-171 / CMMC Level 2 adherence for edge nodes storing telemetry or operator identities.
+      - Zero cloud dependency: Nodes must prove 100% mission functionality when severed from external backhauls.
