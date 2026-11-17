@@ -226,3 +226,18 @@ When creating or modifying code anywhere in this repository:
       - FIPS 140-3 cryptography compliance for local ledger and state channel signatures.
       - NIST SP 800-171 / CMMC Level 2 adherence for edge nodes storing telemetry or operator identities.
       - Zero cloud dependency: Nodes must prove 100% mission functionality when severed from external backhauls.
+
+12. **Executive Virtual Office Suite & Agent Governance Roster:**
+    - **Physical & Spatial Layout:**
+      - The virtual node office renders in 3D through `nautilus_world` and `lemuria_desktop_runner`, hosting three dedicated executive stations:
+      - **Center Desk (0.0, 1.2, -3.0): Triton (Chief of Staff & Cluster Governor)**
+        - *Responsibilities:* Manages fleet health, enforces OpenRaft consensus across Pi 1, Pi 2, and workstation, routes tasks, and oversees FIPS air-gap compliance.
+        - *Node Anchors:* Seed Node (`10.0.0.58`) & Host Workstation.
+      - **West Wing Desk (-2.5, 1.2, -1.5): Sebastian (Marketing & Sales Director)**
+        - *Responsibilities:* Drives audience acquisition for `tr7n7t7.com`, manages the $12/yr Coral VIP membership funnels, and syndicates Seven Daughters Siren Radio.
+        - *Node Anchors:* Screen Node (`10.0.0.60`) touchscreen portal.
+      - **East Wing Desk (2.5, 1.2, -1.5): Ursula (Chief Growth Strategist & Capital Allocator)**
+        - *Responsibilities:* Oversees Charter Cyan trading parameters, liquidity velocity, SBIR/DoD contract positioning, and ecosystem yield generation.
+        - *Node Anchors:* Workstation Dedicated Discrete Intel Iris Xe MAX GPU.
+    - **Agent Governance Protocol:**
+      - Multi-agent consensus: All business directives and on-chain capital deployments must pass a 2-of-3 quorum between Triton, Sebastian, and Ursula before execution.
