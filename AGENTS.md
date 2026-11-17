@@ -241,3 +241,10 @@ When creating or modifying code anywhere in this repository:
         - *Node Anchors:* Workstation Dedicated Discrete Intel Iris Xe MAX GPU.
     - **Agent Governance Protocol:**
       - Multi-agent consensus: All business directives and on-chain capital deployments must pass a 2-of-3 quorum between Triton, Sebastian, and Ursula before execution.
+
+13. **Supply-Chain & Network Perimeter Hardening Standards:**
+    - **GitHub Branch Protection Active:**
+      - The `master` branch on `Neptune537/atlantis-node` enforces protection against unauthorized force-pushes (`allow_force_pushes: false`) and accidental branch deletion (`allow_deletions: false`).
+    - **Node Firewall & Port Isolation Policy:**
+      - All critical node service ports (`8081` Atlantis API, `8082` Siren Radio, `8787` Charter Cyan Engine, `9001` OpenRaft, `22` SSH) are restricted strictly to local subnet interfaces (`10.0.0.0/24`) and loopback (`127.0.0.1`).
+      - External public access is granted exclusively through the reverse Cloudflare Tunnel (`radio.tr7n7t7.com`), completely blocking port scanning and Shodan bot ingestion from the public internet.
